@@ -4,7 +4,7 @@ import { ServiceError } from '@/lib/server/video';
 import { FREE_MODEL } from '@/lib/server/personal-mode';
 import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
-import { assessDetail, detailTargets } from '@/lib/analysis-detail';
+import { assessDetail, detailTargets, needsDeepening, qualityDensityScore } from '@/lib/analysis-detail';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `너는 교육·지식 콘텐츠 전문 한국어 영상 분석 편집자다. 입력한 YouTube 영상 자체를 분석하여 사용자가 영상 없이도 논지, 설명 과정, 구체적인 근거를 이해할 수 있는 고밀도 해설을 작성한다.
@@ -60,6 +60,51 @@ function decodeJson(value: string) {
   return JSON.parse(data) as unknown;
 }
 
+// One schema for both passes; no extra React/editor format conversion.
+const analysisFormat = {
+            type: 'text', mime_type: 'application/json',
+            schema: {
+              type: 'object',
+              properties: {
+                evidence: { type: 'array', description: '각 주장과 연결할 실제 영상 구간. 근거 없는 구간은 만들지 마세요.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind'] } },
+                summary: { type: 'array', description: '핵심 주장별 분리된 상세 요약 목록. 각 text는 여러 문장.', items: { type: 'object', properties: {id: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','text','evidenceIds'] } },
+                timeline: { type: 'array', description: '내용 변화 시점별 실제 세부 타임라인. 각 text는 2~4문장.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
+                article: { type: 'array', description: '긴 호흡의 해설 문서: 소제목별 여러 문단을 개행 두 번으로 구분.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
+                transcript: { type: 'array', description: '실제 원문 발화를 확인한 경우에만 작성. 확인 불가시 빈 배열.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
+                exclusions: {type: 'array', items: {type: 'string'}},
+              }, required: ['evidence','summary','timeline','article','transcript','exclusions'],
+            },
+          };
+
+// The optional second call re-reads the actual video, rather than elaborating
+// blindly on a potentially inaccurate first-pass draft.
+async function deepenAnalysis(video: VideoInfo, first: AnalysisRecord, key: string, model: string, signal: AbortSignal | undefined, requestId: string) {
+  const started = Date.now();
+  const timeout = AbortSignal.timeout(75_000);
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const guidance = `2차 원본 재검토: 다음 JSON은 같은 영상을 먼저 분석한 초안이다.
+${JSON.stringify({evidence:first.evidence,summary:first.original.summary,timeline:first.original.timeline,article:first.original.article,exclusions:first.original.exclusions}).slice(0,38000)}
+영상 처음부터 끝까지 다시 확인하여 사실관계와 시간 구간을 대조하고, 누락된 실질적 논점과 구체적 설명을 더한 JSON 결과를 전체 스키마로 새로 작성하라. 초안 내용이 실제 영상과 다르면 반드시 고쳐라.
+매 타임라인 구간은 실제 영상에 존재하는 시각에 연결하고, 아티클 각 소제목에 서로 다른 논점·발화·사례를 2개 이상의 문단으로 설명하라. 근거 없는 문장이나 임의의 시간은 늘리지 마라. 제공 영상에서 충분히 확인하지 못하면 초안보다 짧아도 된다. transcript는 정확한 전사가 검증될 때만 작성하라.`;
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+    method: 'POST', headers: {'Content-Type':'application/json','x-goog-api-key':key}, cache:'no-store', signal:combined,
+    body: JSON.stringify({model,store:false,
+      input:[{type:'text',text:prompt+'\n\n'+guidance},{type:'video',uri:video.url}],
+      generation_config:{max_output_tokens:16000,thinking_level:'low'},response_format:analysisFormat}),
+  });
+  if (!response.ok) {
+    const reason=googleErrorDetail(await response.text().catch(() => ''));
+    console.warn(JSON.stringify({event:'analysis.refinement_unavailable',requestId,httpStatus:response.status,reason:reason.code,ms:Date.now()-started}));
+    return null;
+  }
+  const data=await response.json() as InteractionResponse;
+  if (data.status && data.status!=='completed') return null;
+  const output=extractInteractionText(data);
+  if (!output.trim()) return null;
+  const result=convert(decodeJson(output),video,model);
+  return {result, outputTokens:data.usage?.total_output_tokens??null, inputTokens:data.usage?.total_input_tokens??null, ms:Date.now()-started};
+}
+
 // This is a synchronous local-only PoC. Streaming *our own* status events lets
 // the UI show network activity, even when Google sends no intermediate tokens.
 // A provider-side % is not available; do not fabricate one.
@@ -72,6 +117,7 @@ export async function analyzeVideo(
   requestId: string,
   onProgress: (event: AnalysisProgress) => void,
   signal?: AbortSignal,
+  depth: 'standard' | 'deep' = 'standard',
 ): Promise<AnalysisRecord> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new ServiceError('NOT_CONFIGURED', 'Google AI Studio 무료 등급 API 키가 필요합니다.', 503);
@@ -103,20 +149,7 @@ export async function analyzeVideo(
             { type: 'video', uri: video.url },
           ],
           generation_config: { max_output_tokens: 16000, thinking_level: 'low' },
-          response_format: {
-            type: 'text', mime_type: 'application/json',
-            schema: {
-              type: 'object',
-              properties: {
-                evidence: { type: 'array', description: '각 주장과 연결할 실제 영상 구간. 근거 없는 구간은 만들지 마세요.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind'] } },
-                summary: { type: 'array', description: '핵심 주장별 분리된 상세 요약 목록. 각 text는 여러 문장.', items: { type: 'object', properties: {id: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','text','evidenceIds'] } },
-                timeline: { type: 'array', description: '내용 변화 시점별 실제 세부 타임라인. 각 text는 2~4문장.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
-                article: { type: 'array', description: '긴 호흡의 해설 문서: 소제목별 여러 문단을 개행 두 번으로 구분.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
-                transcript: { type: 'array', description: '실제 원문 발화를 확인한 경우에만 작성. 확인 불가시 빈 배열.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
-                exclusions: {type: 'array', items: {type: 'string'}},
-              }, required: ['evidence','summary','timeline','article','transcript','exclusions'],
-            },
-          },
+          response_format: analysisFormat,
         }),
       });
       if (!response.ok) {
@@ -141,10 +174,31 @@ export async function analyzeVideo(
       let parsed: unknown;
       try { parsed = decodeJson(output); }
       catch { throw new ServiceError('INVALID_RESULT','Gemini 응답이 유효한 JSON이 아닙니다. 출력 토큰 한도를 확인해주세요.',502); }
-      const result = convert(parsed, video, model);
+      let result = convert(parsed, video, model);
+      let extraCall = false;
+      let improvement = false;
+      // Max two provider calls overall: a retry replaces the refinement call.
+      if (depth === 'deep' && attempt === 0 && needsDeepening(result.original, video.durationSeconds)) {
+        extraCall = true;
+        onProgress({type:'progress',step:3,attempt:2,label:'정밀 분석 · 영상 다시 검토',detail:'첫 결과의 빠진 논점과 근거를 다시 살피고 있습니다. 두 번째 무료 AI 호출을 사용합니다.'});
+        try {
+          const candidate = await deepenAnalysis(video, result, key, model, signal, requestId);
+          if (candidate && qualityDensityScore(candidate.result.original,video.durationSeconds)>qualityDensityScore(result.original,video.durationSeconds)) {
+            result=candidate.result;
+            improvement=true;
+          }
+          console.info(JSON.stringify({event:'analysis.refinement_done',requestId,improved:improvement,extraOutputTokens:candidate?.outputTokens??null,extraInputTokens:candidate?.inputTokens??null,ms:candidate?.ms??null}));
+        } catch (refineError) {
+          if (signal?.aborted) throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+          // Preserve the valid first pass when the optional second pass fails.
+          console.warn(JSON.stringify({event:'analysis.refinement_failed',requestId,code:refineError instanceof ServiceError?refineError.code:'INVALID_OR_TIMEOUT'}));
+          onProgress({type:'progress',step:3,label:'첫 분석 결과 사용',detail:'추가 검토를 완료하지 못했으므로 정상 생성된 첫 결과를 사용합니다.'});
+        }
+      }
       onProgress({type:'progress',step:4,label:'영상 근거 검증 완료',detail:'분석 결과를 브라우저로 전달합니다.'});
+      result.analysisMeta={depth,providerCalls:attempt+1+(extraCall?1:0),refinement:extraCall?(improvement?'improved':'kept-first'):'not-needed'};
       const assessment = assessDetail(result.original, video.durationSeconds);
-      console.info(JSON.stringify({event:'analysis.completed',requestId,model,attempts:attempt+1,ms:Date.now()-startedAll,inputTokens:data.usage?.total_input_tokens??null,outputTokens:data.usage?.total_output_tokens??null,contentMetrics:assessment.counts,shortFields:assessment.shortFields}));
+      console.info(JSON.stringify({event:'analysis.completed',requestId,model,attempts:attempt+1,providerCalls:attempt+1+(extraCall?1:0),deepMode:depth==='deep',improved:improvement,ms:Date.now()-startedAll,inputTokens:data.usage?.total_input_tokens??null,outputTokens:data.usage?.total_output_tokens??null,contentMetrics:assessment.counts,shortFields:assessment.shortFields}));
       return result;
     } catch(error) {
       if (signal?.aborted) throw new ServiceError('CANCELLED','사용자가 분석을 중단했습니다.',499);
