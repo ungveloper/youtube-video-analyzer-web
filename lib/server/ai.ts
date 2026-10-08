@@ -83,14 +83,14 @@ const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
 }
-async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string}) {
+async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium'}) {
   const timeout=AbortSignal.timeout(args.timeoutMs);
   const signal=args.signal?AbortSignal.any([args.signal,timeout]):timeout;
   const started=Date.now();
   const response=await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
     method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':args.key},
     cache:'no-store',signal,
-    body:JSON.stringify({model:args.model,store:false,input:args.input,generation_config:{max_output_tokens:16000,thinking_level:args.model==='gemini-3.8-flash'?'medium':'low'},response_format:args.format}),
+    body:JSON.stringify({model:args.model,store:false,input:args.input,generation_config:{max_output_tokens:16000,thinking_level:args.thinkingLevel??(args.model==='gemini-3.8-flash'?'medium':'low')},response_format:args.format}),
   });
   if(!response.ok){
     const detail=googleErrorDetail(await response.text().catch(() => ''));
@@ -114,18 +114,56 @@ function recordFromContent(video:VideoInfo,model:string,evidence:Evidence[],cont
   return {id:crypto.randomUUID(),video,createdAt:now,updatedAt:now,model,evidence,original:content,edited:structuredClone(content)};
 }
 async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal):Promise<AnalysisRecord>{
-  onProgress({type:'progress',step:2,attempt:1,label:'1/2 · 영상 근거 추출',detail:'영상의 발언·주제 변화·근거 시점을 확인하고 있습니다. AI 내부 진행률은 알 수 없습니다.'});
-  let stage1;
-  try {
-    stage1=await interaction({key,model,requestId,pass:'source-map',format:sourceResponseFormat,input:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],signal,timeoutMs:125000});
-  } catch(error){
-    if(isTimeout(error))throw new ServiceError('TIMEOUT','영상 근거 추출 시간이 초과됐습니다. 짧은 영상으로 다시 시험해주세요.',504);
-    throw error;
+  // Source extraction is the expensive video-bearing request. Most analyses
+  // use exactly two provider calls (video + text). On transient 5xx/timeouts,
+  // retry ONLY this step once, retaining the user-selected model. In that case
+  // deep mode uses at most three calls; never auto-switch to a paid model.
+  let stage1: Awaited<ReturnType<typeof interaction>> | null = null;
+  let sourceCalls = 0;
+  for (let retry = 0; retry < 2; retry++) {
+    if (signal?.aborted) throw new ServiceError('CANCELLED', '분석이 중단되었습니다.', 499);
+    sourceCalls++;
+    onProgress({
+      type:'progress',step:2,attempt:sourceCalls,
+      label:retry===0?'1/2 · 영상 근거 추출':'1/2 · 영상 근거 추출 재시도',
+      detail:retry===0
+        ? '원본 영상에서 근거를 추출합니다. 모델 내부 처리율은 확인할 수 없습니다.'
+        : 'Google의 일시적 오류로 잠시 기다린 뒤 한 번만 재시도합니다. 정상 2회 대신 최대 3회 호출될 수 있습니다.',
+    });
+    try {
+      stage1=await interaction({
+        key,model,requestId,pass:'source-map',format:sourceResponseFormat,
+        input:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],
+        signal,timeoutMs:125000,
+        // Video extraction is simpler than final composition; lower thinking
+        // reduces reasoning overhead without changing the selected model.
+        thinkingLevel:'low',
+      });
+      break;
+    } catch (error) {
+      if (signal?.aborted) throw new ServiceError('CANCELLED', '분석이 중단되었습니다.', 499);
+      const converted=isTimeout(error)
+        ? new ServiceError('TIMEOUT','영상 근거 추출 시간이 초과됐습니다.',504)
+        : error;
+      const retryable=(converted instanceof ServiceError && ['TEMPORARY_HTTP','TIMEOUT'].includes(converted.code))
+        || (converted instanceof Error && !(converted instanceof ServiceError) && /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i.test(converted.message));
+      if (retry===0 && retryable) {
+        console.warn(JSON.stringify({event:'analysis.source_retry_scheduled',requestId,model,afterAttempt:sourceCalls,code:converted instanceof ServiceError?converted.code:'NETWORK_ERROR'}));
+        await new Promise<void>(resolve=>setTimeout(resolve,1400));
+        continue;
+      }
+      if (converted instanceof ServiceError && converted.code==='TEMPORARY_HTTP') {
+        throw new ServiceError('PROVIDER_TEMPORARY',
+          `선택한 ${model} 모델의 영상 입력 처리에서 Google 서버 오류가 ${sourceCalls}회 발생했습니다. 잠시 후 다시 시도하거나, 화면에서 Gemini 3.5 Flash-Lite를 직접 선택해 비교해주세요. 자동 유료 모델 전환은 하지 않습니다. 마지막 오류: ${converted.message}`,502);
+      }
+      throw converted;
+    }
   }
+  if (!stage1) throw new ServiceError('PROVIDER_UNAVAILABLE','근거 추출 결과가 없습니다.',502);
   let source;
   try { source=parseSourceMap(stage1.parsed,video); }
   catch(error){throw new ServiceError('INVALID_SOURCE_MAP',error instanceof Error?error.message:'원본 근거를 추출하지 못했습니다.',502);}
-  onProgress({type:'progress',step:3,attempt:2,label:'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
+  onProgress({type:'progress',step:3,attempt:sourceCalls+1,label:'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
   let content:AnalysisContent;
   let composed=false;
   let stage2tokens:null|{input:number|null;output:number|null}=null;
@@ -144,10 +182,10 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     onProgress({type:'progress',step:3,label:'근거 추출 결과 제공',detail:'상세 문서 생성에 실패하여 1차 근거 요지를 안전하게 표시합니다.'});
   }
   const result=recordFromContent(video,model,source.evidence,content);
-  result.analysisMeta={depth:'deep',providerCalls:2,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length};
+  result.analysisMeta={depth:'deep',providerCalls:sourceCalls+1,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length};
   onProgress({type:'progress',step:4,label:'근거 연결 검사 완료',detail:'존재하는 근거 ID·시간 범위를 확인했습니다. 사실 일치는 원본 대조가 필요합니다.'});
   const quality=assessDetail(content,video.durationSeconds);
-  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:2,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1.tokens.input,firstOutputTokens:stage1.tokens.output,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
+  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+1,sourceCalls,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1.tokens.input,firstOutputTokens:stage1.tokens.output,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
   return result;
 }
 export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL):Promise<AnalysisRecord>{
