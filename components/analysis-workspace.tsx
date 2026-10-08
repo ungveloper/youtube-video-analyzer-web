@@ -1,0 +1,73 @@
+'use client';
+import { useCallback,useEffect,useMemo,useRef,useState } from 'react';
+import Link from 'next/link';
+import { Badge,Button,Card,Tabs } from '@/components/ui/primitives';
+import { getRecord,listRecords,saveRecord } from '@/lib/storage';
+import { exportDocx,exportPdf,exportText,setEdited,toMarkdown } from '@/lib/exporters';
+import { extractVideoId,timestamp } from '@/lib/youtube';
+import type { AnalysisContent,AnalysisRecord, ApiError, Evidence,GroundedItem,QuotaInfo,TranscriptLine,VideoInfo } from '@/lib/types';
+const tabs=[{value:'summary',label:'요약'},{value:'timeline',label:'타임라인'},{value:'article',label:'아티클'},{value:'transcript',label:'스크립트'}];
+type Tab='summary'|'timeline'|'article'|'transcript';
+const messages:Record<string,string>={NOT_CONFIGURED:'분석 서버가 아직 설정되지 않았습니다. README의 API 키·Redis 설정을 확인해주세요.',QUOTA_EXHAUSTED:'오늘의 무료 분석 횟수를 모두 사용했습니다.',GLOBAL_LIMIT:'현재 전체 무료 AI 사용량이 소진되어 신규 분석이 중단되었습니다.',PROVIDER_UNAVAILABLE:'분석 가능한 무료 AI 모델을 사용할 수 없습니다.',VIDEO_UNAVAILABLE:'공개 영상 정보를 확인할 수 없습니다.',VIDEO_TOO_LONG:'30분을 초과하는 영상은 지원하지 않습니다.',SOURCE_UNAVAILABLE:'영상 분석 입력을 확보할 수 없어 처리할 수 없습니다.'};
+export function AnalysisWorkspace({videoId}:{videoId:string}){
+  const valid=extractVideoId(videoId)===videoId;
+  const [video,setVideo]=useState<VideoInfo|null>(null);
+  const [record,setRecord]=useState<AnalysisRecord|null>(null);
+  const [phase,setPhase]=useState<'checking'|'ready'|'processing'|'completed'|'error'>(valid?'checking':'error');
+  const [message,setMessage]=useState(valid?'':'올바르지 않은 영상 ID입니다.');const [warning,setWarning]=useState('');
+  const [tab,setTab]=useState<Tab>('summary');const [editing,setEditing]=useState(false);
+  const [quota,setQuota]=useState<QuotaInfo|null>(null);const [busyExport,setBusyExport]=useState(false);
+  const playerRef=useRef<HTMLIFrameElement|null>(null);
+  const [start,setStart]=useState(0);
+  const [saveState,setSaveState]=useState('');
+  const loadQuota=useCallback(async()=>{try{const r=await fetch('/api/quota',{cache:'no-store'});const q=await r.json() as QuotaInfo;setQuota(q);}catch{setQuota(null);}},[]);
+  useEffect(()=>{if(!valid)return;let active=true;async function init(){try{
+    const params=new URLSearchParams(window.location.search),recordId=params.get('record');let existing:AnalysisRecord|undefined;
+    if(recordId)existing=await getRecord(recordId);else{const all=await listRecords();existing=all.find(a=>a.video.id===videoId);}
+    if(!active)return;
+    if(existing&&existing.video.id===videoId){setRecord(existing);setVideo(existing.video);setPhase('completed');}
+    else { const response=await fetch(`/api/video?id=${videoId}`,{cache:'no-store'});const body=await response.json();if(!response.ok)throw new Error((body as ApiError).error||'영상 정보를 조회하지 못했습니다.');if(active){setVideo(body as VideoInfo);setPhase('ready');}}
+  }catch(e){if(active){setMessage(e instanceof Error?e.message:'데이터를 불러오지 못했습니다.');setPhase('error');}}finally{void loadQuota();}}
+  void init();return()=>{active=false};},[videoId,valid,loadQuota]);
+  const seek=useCallback((time:number)=>{setStart(Math.floor(time));try{playerRef.current?.contentWindow?.postMessage(JSON.stringify({event:'command',func:'seekTo',args:[Math.floor(time),true]}),'https://www.youtube.com');}catch{}},[]);
+  async function begin(){if(!video||phase==='processing')return;if(record&&!confirm('새로 분석하면 무료 횟수 1회를 사용합니다. 기존 결과는 브라우저에 보관되지만 새 결과로 화면을 전환합니다. 계속할까요?'))return;
+    setPhase('processing');setMessage('AI가 영상을 분석하고 있습니다. 페이지를 유지해주세요.');setWarning('');setEditing(false);const requestId=crypto.randomUUID();
+    try{const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({videoId:video.id,requestId})});const body=await res.json();if(!res.ok){const b=body as ApiError;throw new Error(messages[b.code||'']||b.error||'분석할 수 없습니다.');}
+    const data=body as {analysis:AnalysisRecord};const result=data.analysis;
+    try{await saveRecord(result);setSaveState('IndexedDB 저장 완료')}catch(e){setSaveState('브라우저 저장 실패');setWarning(`분석은 완료됐지만 브라우저 저장에 실패했습니다. 결과를 즉시 다운로드해주세요. ${e instanceof Error?e.message:''}`)}
+    setRecord(result);setPhase('completed');setMessage('');await loadQuota();
+    }catch(e){setMessage(e instanceof Error?e.message:'알 수 없는 분석 오류');setPhase(record?'completed':'ready');await loadQuota();}
+  }
+  const changed=record?JSON.stringify(record.original)!==JSON.stringify(record.edited):false;
+  function changeItem(target:Tab,id:string,text:string){setRecord(prev=>prev?{...prev,updatedAt:new Date().toISOString(),edited:setEdited(prev.edited,target,id,text)}:prev);setSaveState('저장 대기 중');}
+  function changeTitle(target:'summary'|'timeline'|'article',id:string,title:string){setRecord(prev=>prev?{...prev,updatedAt:new Date().toISOString(),edited:{...prev.edited,[target]:prev.edited[target].map(v=>v.id===id?{...v,title,edited:true}:v)}}:prev);setSaveState('저장 대기 중');}
+  function changeExclusions(text:string){setRecord(prev=>prev?{...prev,updatedAt:new Date().toISOString(),edited:{...prev.edited,exclusions:text.split('\n').map(v=>v.trim()).filter(Boolean)}}:prev);setSaveState('저장 대기 중');}
+  useEffect(()=>{if(!record||saveState!=='저장 대기 중')return;const timeout=setTimeout(()=>{void saveRecord(record).then(()=>setSaveState('자동 저장 완료')).catch(()=>setSaveState('저장 실패 — 브라우저 저장 공간을 확인해주세요.'));},600);return()=>clearTimeout(timeout);},[record,saveState]);
+  async function reset(){if(!record||!confirm('이 결과에서 사용자 수정 내용을 모두 버리고 최초 AI 결과로 복원할까요?'))return;const next={...record,updatedAt:new Date().toISOString(),edited:structuredClone(record.original)};setRecord(next);try{await saveRecord(next);setSaveState('원본 복원 완료')}catch{setSaveState('저장 실패')}}
+  async function exportTo(kind:'md'|'txt'|'docx'|'pdf'){if(!record)return;setBusyExport(true);try{if(kind==='md'||kind==='txt')exportText(record,kind);else if(kind==='docx')exportDocx(record);else await exportPdf(record);}catch(e){setWarning(e instanceof Error?e.message:'문서 생성에 실패했습니다.')}finally{setBusyExport(false)}}
+  async function copy(){if(!record)return;const content:AnalysisContent=record.edited;const value=tab==='transcript'?content.transcript.map(l=>`[${timestamp(l.startSeconds)}] ${l.text}`).join('\n'):content[tab].map(x=>`${x.title?x.title+'\n':''}${x.text}`).join('\n\n');try{await navigator.clipboard.writeText(value||toMarkdown(record));setSaveState('복사 완료')}catch{setWarning('클립보드 복사 권한을 확인해주세요.')}}
+  const selected=useMemo(()=>record?.edited[tab]??[],[record,tab]);const evidence=record?.evidence??[];
+  return <main className="mx-auto max-w-[1600px] px-4 py-6 sm:px-6 sm:py-9">
+    <div className="mb-6 flex flex-wrap items-center justify-between gap-3"><div><Link href="/" className="text-xs text-slate-400 hover:text-white">← 다른 영상 분석</Link><h1 className="mt-2 text-xl font-semibold tracking-tight sm:text-2xl">영상 분석 작업 공간</h1></div><div className="flex flex-wrap items-center gap-2"><Badge>최대 30분</Badge><Badge>{quota?.enabled?`남은 분석 ${quota.remaining}/3`:'분석 API 미설정'}</Badge></div></div>
+    <div className="grid gap-5 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] lg:items-start">
+      <div className="space-y-4 lg:sticky lg:top-5">
+        <Card className="overflow-hidden"><div className="aspect-video bg-black">{valid?<iframe ref={playerRef} className="h-full w-full" src={`https://www.youtube.com/embed/${videoId}?enablejsapi=1&playsinline=1&start=${start}`} title="YouTube 영상 플레이어" loading="lazy" referrerPolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen/>:<p className="p-6">잘못된 영상 ID</p>}</div><div className="p-5"><h2 className="font-semibold leading-7">{video?.title||'영상 정보를 확인하는 중입니다'}</h2><p className="mt-1 text-sm text-slate-400">{video?.channel||'YouTube'} {video?.durationSeconds?`· ${timestamp(video.durationSeconds)}`:''}</p><a className="mt-3 inline-block text-xs text-indigo-300 hover:underline" href={`https://www.youtube.com/watch?v=${videoId}`} target="_blank" rel="noopener noreferrer">YouTube에서 원본 보기 ↗</a></div></Card>
+        <Card className="p-5"><div className="flex items-center justify-between gap-2"><h3 className="font-semibold">분석 상태</h3><Badge>{({checking:'조회 중',ready:'준비',processing:'분석 중',completed:'완료',error:'오류'})[phase]}</Badge></div><p role="status" className="mt-3 text-sm leading-7 text-slate-400">{message||(phase==='completed'?'브라우저에 저장된 결과입니다. 무료 횟수 없이 다시 볼 수 있습니다.':phase==='ready'?'영상 정보를 확인했습니다. 분석 서버 설정이 준비되면 시작할 수 있습니다.':'입력 자료와 서버 설정을 확인합니다.')}</p>{phase==='processing'&&<div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-800"><div className="h-full w-1/3 animate-pulse rounded-full bg-indigo-400"/></div>}
+        <Button className="mt-4 w-full" onClick={begin} disabled={!video||phase==='processing'||phase==='checking'||phase==='error'||(quota?.enabled!==true)||(quota.remaining<=0)}>{phase==='processing'?'분석 요청 처리 중…':record?'새로 분석 (1회 사용)':'AI 분석 시작 (1회 예약)'}</Button>
+        {record&&<p className="mt-3 text-xs text-slate-500">기존 결과 재열람은 무료입니다. 새 분석만 횟수를 사용합니다.</p>}</Card>
+        <Card className="p-5 text-xs leading-6 text-slate-400"><p className="font-semibold text-slate-200">중요 안내</p><p className="mt-2">AI 분석은 원본 내용을 완벽하게 보증하지 않습니다. 시간 근거는 반드시 영상을 재생해 확인하세요. 원문을 확보하지 못한 경우 스크립트를 만들지 않습니다.</p><p className="mt-2">브라우저를 닫으면 진행 중인 분석 결과가 유실될 수 있습니다.</p></Card>
+      </div>
+      <Card className="min-w-0 overflow-hidden"><div className="border-b border-slate-800 p-4 sm:p-5"><div className="flex flex-wrap items-center justify-between gap-2"><div><h2 className="font-semibold">분석 결과</h2><p className="mt-1 text-xs text-slate-500">한국어 · 원본 영상 근거 · 편집 가능한 콘텐츠</p></div>{record&&<Badge>{changed?'사용자 편집본':'AI 원본'}</Badge>}</div><div className="mt-4"><Tabs value={tab} onChange={v=>{setTab(v as Tab);setEditing(false)}} items={tabs}/></div></div>
+        <div className="min-h-[350px] p-4 sm:p-6">{warning&&<div role="alert" className="mb-4 rounded-xl border border-amber-700/50 bg-amber-950/20 p-3 text-sm text-amber-200">{warning}</div>}
+        {!record?<div className="flex min-h-[310px] flex-col items-center justify-center text-center"><div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10 text-3xl text-indigo-300">✦</div><h3 className="text-lg font-semibold">아직 분석 결과가 없습니다</h3><p className="mt-3 max-w-sm text-sm leading-7 text-slate-400">영상 정보를 확인하고 AI 분석을 시작하면 요약·타임라인·아티클·스크립트가 여기에 표시됩니다. 설정 전에는 가상 결과를 생성하지 않습니다.</p></div>:
+        <><div className="mb-5 flex flex-wrap items-center justify-between gap-2"><p className="text-xs text-slate-500">{selected.length}개 항목 {tab==='transcript'?'· 원문 확보 시에만 제공':''}</p><div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={()=>setEditing(x=>!x)}>{editing?'편집 종료':'편집'}</Button><Button variant="ghost" onClick={reset} disabled={!changed}>원본 복원</Button><Button variant="ghost" onClick={copy}>복사</Button></div></div>
+        {selected.length===0?<div className="rounded-xl border border-dashed border-slate-700 p-8 text-sm leading-7 text-slate-400">{tab==='transcript'?'원문 전사를 확보하지 못해 정확한 스크립트를 제공할 수 없습니다.':'검증 가능한 근거를 확보하지 못해 이 영역은 비어 있습니다.'}</div>:<div className="space-y-5">{selected.map(item=>{
+          const isTranscript=tab==='transcript';const it=item as GroundedItem|TranscriptLine;const ids=('evidenceIds' in it)?it.evidenceIds:[];
+          const refs=ids.map(id=>evidence.find(x=>x.id===id)).filter((e):e is Evidence=>Boolean(e));
+          return <section key={it.id} className="rounded-xl border border-slate-800 bg-slate-950/50 p-4"><div className="mb-3 flex flex-wrap items-center gap-2">{'title' in it&&it.title&&(editing&&tab!=='transcript'?<input aria-label="항목 제목 편집" className="mr-auto w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-semibold focus:border-indigo-400 focus:outline-none" value={it.title} onChange={e=>changeTitle(tab as 'summary'|'timeline'|'article',it.id,e.target.value)}/>:<h3 className="mr-auto font-semibold text-slate-100">{it.title}</h3>)}{isTranscript&&<button className="mr-auto text-xs font-semibold text-indigo-300 hover:underline" onClick={()=>seek((it as TranscriptLine).startSeconds)}>{timestamp((it as TranscriptLine).startSeconds)}</button>}{it.edited&&<Badge>사용자 수정 · 대조 필요</Badge>}{isTranscript&&(it as TranscriptLine).translated&&<Badge>한국어 번역</Badge>}</div>{editing?<textarea aria-label="내용 편집" className="min-h-36 w-full rounded-xl border border-slate-700 bg-slate-900 p-3 text-sm leading-7 outline-none focus:border-indigo-400" value={it.text} onChange={e=>changeItem(tab,it.id,e.target.value)}/>:<p className="prose-content text-sm text-slate-300">{it.text}</p>}{refs.length>0&&<div className="mt-4 flex flex-wrap gap-2 border-t border-slate-800 pt-3">{refs.map(r=><button key={r.id} onClick={()=>seek(r.startSeconds)} className="rounded-lg bg-indigo-500/10 px-3 py-1.5 text-xs font-medium text-indigo-300 hover:bg-indigo-500/20" title="이 영상 위치 재생">▶ {timestamp(r.startSeconds)}–{timestamp(r.endSeconds)}</button>)}</div>}{isTranscript&&<p className="mt-2 text-xs text-slate-500">영상 속 실제 발화와 일치하는지 원본을 확인해주세요.</p>}</section>})}</div>}
+        {(record.edited.exclusions.length>0||editing)&&<div className="mt-6 rounded-xl border border-amber-700/40 bg-amber-900/10 p-4"><h3 className="text-sm font-semibold text-amber-200">확인할 수 없어 제외한 내용</h3>{editing?<textarea aria-label="분석에서 제외된 내용 편집" className="mt-3 min-h-24 w-full rounded-lg border border-amber-800 bg-slate-950 p-3 text-xs leading-6 text-amber-100 focus:outline-none" value={record.edited.exclusions.join('\n')} onChange={e=>changeExclusions(e.target.value)}/>:<ul className="mt-2 list-inside list-disc text-xs leading-6 text-amber-100/80">{record.edited.exclusions.map((s,i)=><li key={i}>{s}</li>)}</ul>}</div>}
+        <div className="mt-6 border-t border-slate-800 pt-5"><p className="text-xs text-slate-500" role="status">{saveState||'결과는 현재 브라우저에만 저장됩니다.'}</p><h3 className="mt-4 mb-3 text-sm font-semibold">전체 결과 다운로드</h3><div className="grid grid-cols-2 gap-2 sm:grid-cols-4"><Button variant="secondary" disabled={busyExport} onClick={()=>exportTo('md')}>Markdown</Button><Button variant="secondary" disabled={busyExport} onClick={()=>exportTo('txt')}>TXT</Button><Button variant="secondary" disabled={busyExport} onClick={()=>exportTo('pdf')}>PDF</Button><Button variant="secondary" disabled={busyExport} onClick={()=>exportTo('docx')}>Word</Button></div><p className="mt-3 text-xs leading-6 text-slate-500">다운로드는 편집본 기준입니다. PDF는 한국어 표시를 위해 페이지 이미지를 사용하므로 본문을 텍스트로 선택할 수 없습니다.</p></div></>}
+        </div></Card>
+    </div>
+  </main>
+}

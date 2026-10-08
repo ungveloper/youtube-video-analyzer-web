@@ -1,36 +1,81 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# YouTube AI Analyzer (PRD v1.0)
 
-## Getting Started
+Next.js 16 App Router / React 19 / Tailwind CSS 4 / TypeScript. 다크 모드 중심, 데스크톱 영상+분석 좌우 분할, 모바일 상하 배치.
 
-First, run the development server:
+> **내부 기술 검증 단계.** YouTube Data API는 공개 영상의 제목·길이 등을 제공하지만 제3자 영상의 자막 전문을 자유롭게 제공하지 않습니다. 분석 URL 직접 입력을 지원하는 AI 제공자 설정 없이는 실제 AI 분석이 작동하지 않습니다. 무단 다운로드·스크래핑 코드는 포함하지 않았습니다.
+
+## 구현된 기능
+
+- YouTube ID, `watch`, `youtu.be`, Shorts, embed URL 식별 및 공개 상태·최대 30분 검증
+- 공식 YouTube 임베드 플레이어, 타임스탬프 이동, 반응형 다크 UI
+- 한국어 요약/타임라인/상세 아티클/원문 확보 시 번역 스크립트, 근거 링크와 제외 안내
+- 모든 분석 결과 직접 편집, 최초 분석 원본 복원, 자동 저장 (브라우저 IndexedDB)
+- 최근 기록 및 재열람/검색/삭제, 결과 전체 복사와 Markdown/TXT/PDF/DOCX 다운로드
+- 서버 측 익명 쿠키 및 Redis 원자적 무료 횟수 예약 (한국 시간 기준 하루 3회), 중복 요청 방지, 일시 오류 재시도 1회
+- 전체 일일 요청 및 처리 초 상한, 중단 스위치, 모델별 교체 가능한 기본/대체 설정, 구조화된 사용량 로그
+- 관리자 페이지·로그인·서버 영구 보관·공유 링크 없음
+
+## 초기 설정
 
 ```bash
+npm ci
+cp .env.example .env.local
+# 아래 환경변수를 설정
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`.env.local`은 절대로 Git에 Push하지 마세요. `.env.example`을 참조합니다.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+필수:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. `YOUTUBE_API_KEY`: YouTube Data API v3를 활성화한 Google Cloud 프로젝트의 서버 API 키. 가능하다면 API 제한을 적용하십시오.
+2. `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Upstash Redis REST 연결.
+3. `GEMINI_API_KEY`: **선택적으로 활성화할 수 있는 PoC 제공자**. 현재 구현에서 공개 YouTube URL을 직접 분석하는 실제 API 제공자는 이것뿐입니다. 반드시 제공자의 무료 한도, 데이터 이용 및 상업적 이용 조건을 사전에 검토하세요. API 키가 없다면 UI만 테스트되고 분석은 차단됩니다.
+4. `QUOTA_HASH_SECRET`: **필수**. 임의의 긴 비밀값으로 IP를 일방향 해시하고 요청 제한에 사용합니다.
 
-## Learn More
+`GEMINI_MODEL` 기본값은 `gemini-2.5-flash`입니다. YouTube URL 수용 및 무료 제공 여부는 프로젝트·모델·시점마다 달라질 수 있습니다. `GEMINI_FALLBACK_MODEL`은 **YouTube URL 입력과 무료 할당량을 별도 검증한 모델**로만 설정하세요. 빈 값이면 기본 모델로 1회 재시도합니다. 어떠한 유료 자동 전환도 구현하지 않았습니다.
 
-To learn more about Next.js, take a look at the following resources:
+### 외부 콘솔
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- Vercel: 런타임 로그, 오류 및 함수 사용량
+- Google Cloud Console: YouTube Data API 할당량
+- AI 제공자 콘솔: 모델별 토큰·동영상 처리 할당량 및 과금 여부
+- Upstash Console: Redis 사용량, 작업 잠금/무료 횟수
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+서버 로그에는 `analysis.completed`, `analysis.attempt_failed`, `ai.http_error`, `youtube.failure` 등의 이벤트와 요청 ID, 재시도 수, 처리 시간, 사용 토큰(제공된 경우)을 남깁니다. 분석 본문은 기록하지 않습니다. `estimatedCostUsd`는 토큰 수와 환경변수 `AI_INPUT_USD_PER_1M_TOKENS`, `AI_OUTPUT_USD_PER_1M_TOKENS`가 모두 설정된 경우에만 추정하며, 실제 청구액과 다릅니다.
 
-## Deploy on Vercel
+## API
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- `GET /api/video?id=VIDEO_ID`: 길이·공개 여부 검증, 메타데이터 반환
+- `GET /api/quota`: 익명 식별자 쿠키 발급, 남은 횟수 조회
+- `POST /api/analyze`: `{videoId,requestId: UUID}`; 서버에서 같은 출처/사용량/영상 검증, AI 실행, 성공 시 횟수 확정/실패 시 반환
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**서비스 중단:** `ANALYSIS_PAUSED=true` 설정. 서버에 영구 결과 저장은 없으며, 완료된 콘텐츠는 브라우저에만 저장됩니다.
+
+### 실행 제한 및 동기 분석 PoC
+
+Vercel Hobby 300초 함수 제한을 고려하여 개별 요청을 약 5분 미만으로 설정한 **동기 PoC**입니다 (첫 시도 175초, 재시도 85초 + 기타 처리). PRD의 30분 입력/10분 완료는 목표이지 현재 보장 성능이 아닙니다. 실제 10분 장시간 작업 지원에는 별도 비동기 워커, 작업 큐, 안전한 결과 전달 구조가 필요합니다. 이 구현은 브라우저를 닫으면 진행 중인 작업의 결과가 유실될 수 있습니다. Redis 작업 잠금은 TTL 700초이며 함수 강제 종료로 예약이 남으면 만료 후 새 요청이 가능하지만, 정산 로그 점검이 필요합니다.
+
+무료 사용량 계산은 서버가 권위를 가집니다. 브라우저 저장 성공 여부는 서버가 신뢰할 수 없으므로, **검증된 AI 생성 성공 시** 횟수를 확정합니다. 로컬 저장 실패 시 결과 다운로드를 안내하며 무료 횟수는 자동 반환하지 않습니다. 이는 클라이언트가 저장 실패를 위조해 무제한 분석하는 남용을 막기 위한 초기 정책입니다.
+
+전체 일일 AI 동영상 시간 상한은 **자동 재시도까지 고려해 요청당 영상 길이의 2배**를 보수적으로 예약합니다. 무료 API 제공자의 자체 할당량과 일치하지 않으므로 공급자 콘솔에서 실제 사용량 확인이 필수입니다.
+
+## 문서 내보내기
+
+- `.md`, `.txt`: UTF-8 다운로드
+- `.docx`: OpenXML 규격 ZIP (단순 문단 서식), Word에서 편집 가능
+- `.pdf`: 브라우저 Canvas에 한국어 글자를 그려 페이지별 JPEG로 넣는 이미지 기반 PDF (텍스트 선택/검색은 불가). 브라우저 렌더링 글꼴 사용, 별도 글꼴 파일 배포 없음.
+
+모든 형식은 **현재 사용자 편집본 전체**를 다운로드합니다. 원본 영상 구간을 누르면 플레이어가 해당 위치로 이동하며, 편집한 문장의 근거는 반드시 재검증해야 합니다.
+
+## 출시 전 필수 해결 사항
+
+1. YouTube URL 영상 접근 및 자막 없는 영상의 적법한 실제 분석 입력 경로 검증. 현재 PoC는 Gemini 무료 사용 가능 조건에 의존합니다.
+2. 영상 유형별 근거 시간/품질 수동 평가. Zod 수준의 필드 검증만으로 사실성 검증이 보장되지 않습니다.
+3. 30분 영상의 10분 이내 처리 성능 확인, 필요시 워커/큐 구현.
+4. 익명 이용자의 IP/쿠키 우회 한계, Redis 잠금 TTL/실패 정산, 봇 검증 보강.
+5. 상업 서비스 출시 전 Vercel 적합 플랜, 개인정보처리방침, 약관, 영상/전사 저작권, 공급자 데이터 처리 및 YouTube API 정책 확인.
+6. 사용자 편집 원본, 브라우저 저장 공간 소진 및 PDF/DOCX 대용량 파일 교차 브라우저 QA.
+7. PDF 텍스트 검색 가능 방식은 향후 공식 한국어 임베딩 글꼴 기반 PDF 생성기로 개선.
+
+이 저장소는 계정·결제·공개 공유를 아직 포함하지 않습니다. 필요시 SaaS 2단계에서 추가합니다.
