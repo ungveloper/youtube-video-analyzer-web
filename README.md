@@ -76,3 +76,12 @@ npm run dev -- --hostname 127.0.0.1
 3. 오류 코드와 HTTP 상태만 공유하세요. `.env.local` 값, API 키, 요청/응답 원문을 공유하지 마세요.
 4. 입력/모델/API 자체가 지원되지 않는다면 UI를 수정해도 자동 분석을 보장할 수 없습니다. Gemini 무료 등급 계정과 해당 모델의 YouTube URL 지원 여부를 점검해야 합니다.
 5. 데이터베이스와 Redis는 여전히 사용하지 않으며, 완료된 결과는 브라우저 IndexedDB에만 저장합니다.
+
+## v1.3 · 무료 모델 연결 진단
+
+- AI 요청의 `generation_config`에서 지원되지 않는 `temperature` 속성을 제거했습니다.
+- Google 400/401/403/404/429 오류의 HTTP 상태, 공급자 오류 코드와 안전하게 정리한 상세 내용을 보여줍니다.
+- 영상 분석 화면의 **무료 모델 연결 진단** 버튼은 `models.get` 메타데이터만 조회하며 AI 추론을 실행하지 않습니다.
+- 메타데이터 접근 성공은 YouTube 영상 입력 성공이나 Free Tier 과금 상태를 보증하지 않습니다.
+- 오래된 오류 문구를 제거하여 ESLint `no-unused-vars` 경고를 해결했습니다.
+- 상세: `docs/PRD-v1.3-provider-diagnostics.md`.

@@ -10,7 +10,6 @@ import type { AnalysisProgress } from '@/lib/analysis-stream';
 import type { AnalysisContent,AnalysisRecord, ApiError, Evidence,GroundedItem,QuotaInfo,TranscriptLine,VideoInfo } from '@/lib/types';
 const tabs=[{value:'summary',label:'요약'},{value:'timeline',label:'타임라인'},{value:'article',label:'아티클'},{value:'transcript',label:'스크립트'}];
 type Tab='summary'|'timeline'|'article'|'transcript';
-const messages:Record<string,string>={NOT_CONFIGURED:'무료 AI 연결 설정이 필요합니다. .env.local 및 Google AI Studio 무료 등급을 확인해주세요.',FREE_LIMIT:'무료 AI 한도에 도달했습니다. 유료 모델로 전환하지 않습니다.',PERSONAL_ONLY:'개인용 분석은 로컬 개발 서버에서만 사용할 수 있습니다.',PROVIDER_UNAVAILABLE:'분석 가능한 무료 AI 모델을 사용할 수 없습니다.',VIDEO_UNAVAILABLE:'공개 영상 정보를 확인할 수 없습니다.',VIDEO_TOO_LONG:'30분을 초과하는 영상은 지원하지 않습니다.',SOURCE_UNAVAILABLE:'영상 분석 입력을 확보할 수 없어 처리할 수 없습니다.'};
 export function AnalysisWorkspace({videoId}:{videoId:string}){
   const valid=extractVideoId(videoId)===videoId;
   const [video,setVideo]=useState<VideoInfo|null>(null);
@@ -26,6 +25,8 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   const [elapsed,setElapsed]=useState(0);
   const [startedAt,setStartedAt]=useState<number|null>(null);
   const [failure,setFailure]=useState('');
+  const [diagnostic,setDiagnostic]=useState('');
+  const [diagnosticBusy,setDiagnosticBusy]=useState(false);
   const requestController=useRef<AbortController|null>(null);
   useEffect(()=>{
     if(startedAt===null)return;
@@ -34,6 +35,15 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   },[startedAt]);
   useEffect(()=>{const controllerRef=requestController;return()=>controllerRef.current?.abort();},[]);
   const stop=()=>requestController.current?.abort();
+  async function diagnose() {
+    setDiagnosticBusy(true);setDiagnostic('Gemini 모델 정보를 조회하고 있습니다…');
+    try {
+      const response=await fetch('/api/ai-diagnostics',{cache:'no-store'});
+      const data=await response.json() as {ok?:boolean;model?:string;message?:string;httpStatus?:number};
+      setDiagnostic(`${data.ok?'모델 정보 조회 성공':'모델 정보 조회 실패'} · ${data.model||'Gemini'} · ${data.message||`HTTP ${data.httpStatus||response.status}`}`);
+    } catch {setDiagnostic('진단 서버에 연결할 수 없습니다. 개발 서버를 재시작해주세요.');}
+    finally {setDiagnosticBusy(false);}
+  }
   const loadQuota=useCallback(async()=>{try{const r=await fetch('/api/quota',{cache:'no-store'});const q=await r.json() as QuotaInfo;setQuota(q);}catch{setQuota(null);}},[]);
   useEffect(()=>{if(!valid)return;let active=true;async function init(){try{
     const params=new URLSearchParams(window.location.search),recordId=params.get('record');let existing:AnalysisRecord|undefined;
@@ -99,6 +109,8 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
           <Button type="button" variant="secondary" className="w-full" onClick={stop}>진행 중인 분석 중단</Button>
         </div>}
         <Button className="mt-4 w-full" onClick={begin} disabled={!video||phase==='processing'||phase==='checking'||phase==='error'||(quota?.enabled!==true)}>{phase==='processing'?<><span aria-hidden="true" className="mr-2 inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"/>분석 요청 처리 중…</>:record?'다시 분석 (무료 API 호출)':'무료 AI로 분석 시작'}</Button>
+        <Button type="button" variant="secondary" className="mt-2 w-full" disabled={diagnosticBusy||phase==='processing'} onClick={diagnose}>{diagnosticBusy?'모델 연결 확인 중…':'무료 모델 연결 진단 (AI 분석 호출 없음)'}</Button>
+        {diagnostic&&<p role="status" className="mt-2 break-words rounded-lg border border-slate-700 bg-slate-950/60 p-3 text-xs leading-6 text-slate-300">{diagnostic}</p>}
         {record&&<p className="mt-3 text-xs text-slate-500">기존 결과 재열람은 API를 호출하지 않습니다. 새 분석은 무료 등급 요청 한도를 사용합니다.</p>}</Card>
         <Card className="p-5 text-xs leading-6 text-slate-400"><p className="font-semibold text-slate-200">중요 안내</p><p className="mt-2">AI 분석은 원본 내용을 완벽하게 보증하지 않습니다. 시간 근거는 반드시 영상을 재생해 확인하세요. 원문을 확보하지 못한 경우 스크립트를 만들지 않습니다.</p><p className="mt-2">브라우저를 닫으면 진행 중인 분석 결과가 유실될 수 있습니다.</p></Card>
       </div>

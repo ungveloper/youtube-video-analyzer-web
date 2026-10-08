@@ -3,6 +3,7 @@ import type { AnalysisContent,AnalysisRecord,Evidence,GroundedItem,TranscriptLin
 import { ServiceError } from '@/lib/server/video';
 import { FREE_MODEL } from '@/lib/server/personal-mode';
 import type { AnalysisProgress } from '@/lib/analysis-stream';
+import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
 const prompt=`너는 YouTube 공개 영상을 한국어로 분석하는 근거 기반 분석기다.
 규칙: 반드시 실제로 입력된 영상에서 검증 가능한 내용만 출력하라. 제목/설명만 보고 영상 내용을 추측하지 마라. 핵심 주장 하나마다 증거 구간 evidenceIds를 붙여라. 시간은 실제 영상 길이 내 초 단위. 근거 없는 주장/불확실한 수치/작은 글씨는 결과에서 제외하고 exclusions에 간략히 알려라. 모든 출력은 한국어로. 아티클은 이해하기 쉬운 상세 해설형으로 작성하되 외부 지식과 만들어낸 사례를 섞지 마라.
 스크립트는 실제 원문 발화 자료를 충분히 확신할 수 있고 원문과 정확하게 일치하도록 추출할 수 있는 경우에만 작성하라. 외국어 원문을 확보했다면 문장을 한국어로 번역하고 translated=true로 설정하라. 실제 전사가 불가능하면 transcript=[] 로 둬라. 영상의 대사 전체를 상상해서 생성하지 마라.
@@ -47,12 +48,6 @@ function decodeJson(value: string) {
 // the UI show network activity, even when Google sends no intermediate tokens.
 // A provider-side % is not available; do not fabricate one.
 const transientHttp = new Set([408, 500, 502, 503, 504]);
-function safeProviderReason(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw) as {error?: { status?: string; code?: number }};
-    return parsed.error?.status?.replace(/[^A-Z_]/g, '').slice(0, 40) || 'UNKNOWN';
-  } catch { return 'UNKNOWN'; }
-}
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
 }
@@ -88,7 +83,7 @@ export async function analyzeVideo(
             { type: 'text', text: prompt + `\n영상 길이: ${video.durationSeconds}초. ID: ${video.id}. 실제 영상 근거가 불충분하면 해당 내용을 생성하지 마라.` },
             { type: 'video', uri: video.url },
           ],
-          generation_config: { temperature: 0.2, max_output_tokens: 10000 },
+          generation_config: { max_output_tokens: 10000 },
           response_format: {
             type: 'text', mime_type: 'application/json',
             schema: {
@@ -106,20 +101,20 @@ export async function analyzeVideo(
         }),
       });
       if (!response.ok) {
-        const reason = safeProviderReason(await response.text().catch(() => ''));
-        console.error(JSON.stringify({event:'ai.http_error',requestId,model,attempt:attempt+1,httpStatus:response.status,providerReason:reason,ms:Date.now()-started}));
-        const suffix = `Google API HTTP ${response.status} (${reason})`;
-        if (response.status === 429) throw new ServiceError('FREE_LIMIT', `무료 AI 요청 한도가 소진됐습니다. ${suffix}. 유료 모델로 전환하지 않습니다.`, 429);
-        if ([400,401,403,404].includes(response.status)) throw new ServiceError('SOURCE_UNAVAILABLE', `영상 URL, 무료 프로젝트 또는 모델 지원 여부를 확인해주세요. ${suffix}`, 502);
-        if (!transientHttp.has(response.status)) throw new ServiceError('PROVIDER_UNAVAILABLE', `AI 제공자가 요청을 거부했습니다. ${suffix}`, 502);
-        throw new Error(`일시적인 Google API 오류: ${suffix}`);
+        const details = googleErrorDetail(await response.text().catch(() => ''));
+        console.error(JSON.stringify({event:'ai.http_error',requestId,model,attempt:attempt+1,httpStatus:response.status,providerReason:details.code,ms:Date.now()-started}));
+        const explanation = googleErrorMessage(response.status, details);
+        if (response.status === 429) throw new ServiceError('FREE_LIMIT', explanation, 429);
+        if ([400,401,403,404].includes(response.status)) throw new ServiceError('GOOGLE_REQUEST_REJECTED', explanation, 502);
+        if (!transientHttp.has(response.status)) throw new ServiceError('PROVIDER_UNAVAILABLE', explanation, 502);
+        throw new ServiceError('TEMPORARY_HTTP', explanation, 502);
       }
       const data = await response.json() as InteractionResponse;
       // The synchronous API can still return a nonterminal status. Do not
       // mistake it for a completed analysis or blindly retry a running job.
       if (data.status && data.status !== 'completed') {
         const failure = ['failed','cancelled','incomplete','requires_action','in_progress','queued'].includes(data.status);
-        if (failure) throw new ServiceError('INTERACTION_STATUS', `Gemini 응답 상태가 ${data.status}입니다. 완료된 분석 결과를 받지 못했습니다. 요청 ID: ${requestId.slice(0,8)}.`, 502);
+        if (failure) throw new ServiceError('INTERACTION_STATUS', `Gemini 응답 상태: ${data.status}${data.error?.message ? ` · ${googleErrorDetail(JSON.stringify({error:{status:data.error.code,message:data.error.message}})).detail}` : ''}. 완료된 결과를 받지 못했습니다.`, 502);
       }
       const output = extractInteractionText(data);
       if (!output.trim()) throw new ServiceError('INVALID_RESULT', 'Gemini 응답에서 분석 본문을 찾지 못했습니다. 영상 접근 또는 출력 한도를 확인해주세요.', 502);
@@ -138,7 +133,7 @@ export async function analyzeVideo(
       const code = lastError instanceof ServiceError ? lastError.code : 'TRANSIENT_ERROR';
       console.error(JSON.stringify({event:'analysis.attempt_failed',requestId,model,attempt:attempt+1,ms:Date.now()-started,code}));
       // Bad video / rate limits / malformed response are not helped by retrying.
-      if (lastError instanceof ServiceError && !['TIMEOUT'].includes(lastError.code)) throw lastError;
+      if (lastError instanceof ServiceError && !['TIMEOUT','TEMPORARY_HTTP'].includes(lastError.code)) throw lastError;
       if (attempt === 0) {
         onProgress({type:'progress',step:2,attempt:2,label:'일시적 오류 재시도 준비',detail:'첫 요청이 실패했습니다. 같은 무료 모델로 마지막 한 번만 재시도합니다.'});
         await new Promise(resolve => setTimeout(resolve, 1000));
