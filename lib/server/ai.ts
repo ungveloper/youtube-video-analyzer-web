@@ -1,10 +1,11 @@
 import 'server-only';
 import type { AnalysisContent,AnalysisRecord,Evidence,GroundedItem,TranscriptLine,VideoInfo } from '@/lib/types';
 import { ServiceError } from '@/lib/server/video';
-import { FREE_MODEL } from '@/lib/server/personal-mode';
+import { FREE_MODEL, type FreeModelId } from '@/lib/free-models';
 import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
-import { assessDetail, detailTargets, needsDeepening, qualityDensityScore } from '@/lib/analysis-detail';
+import { assessDetail, detailTargets } from '@/lib/analysis-detail';
+import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat } from '@/lib/server/evidence-pipeline';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `너는 교육·지식 콘텐츠 전문 한국어 영상 분석 편집자다. 입력한 YouTube 영상 자체를 분석하여 사용자가 영상 없이도 논지, 설명 과정, 구체적인 근거를 이해할 수 있는 고밀도 해설을 작성한다.
@@ -60,7 +61,8 @@ function decodeJson(value: string) {
   return JSON.parse(data) as unknown;
 }
 
-// One schema for both passes; no extra React/editor format conversion.
+// One-call schema retained for standard mode.
+// No extra React/editor format conversion.
 const analysisFormat = {
             type: 'text', mime_type: 'application/json',
             schema: {
@@ -76,143 +78,101 @@ const analysisFormat = {
             },
           };
 
-// The optional second call re-reads the actual video, rather than elaborating
-// blindly on a potentially inaccurate first-pass draft.
-async function deepenAnalysis(video: VideoInfo, first: AnalysisRecord, key: string, model: string, signal: AbortSignal | undefined, requestId: string) {
-  const started = Date.now();
-  const timeout = AbortSignal.timeout(75_000);
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  const guidance = `2차 원본 재검토: 다음 JSON은 같은 영상을 먼저 분석한 초안이다.
-${JSON.stringify({evidence:first.evidence,summary:first.original.summary,timeline:first.original.timeline,article:first.original.article,exclusions:first.original.exclusions}).slice(0,38000)}
-영상 처음부터 끝까지 다시 확인하여 사실관계와 시간 구간을 대조하고, 누락된 실질적 논점과 구체적 설명을 더한 JSON 결과를 전체 스키마로 새로 작성하라. 초안 내용이 실제 영상과 다르면 반드시 고쳐라.
-매 타임라인 구간은 실제 영상에 존재하는 시각에 연결하고, 아티클 각 소제목에 서로 다른 논점·발화·사례를 2개 이상의 문단으로 설명하라. 근거 없는 문장이나 임의의 시간은 늘리지 마라. 제공 영상에서 충분히 확인하지 못하면 초안보다 짧아도 된다. transcript는 정확한 전사가 검증될 때만 작성하라.`;
-  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-    method: 'POST', headers: {'Content-Type':'application/json','x-goog-api-key':key}, cache:'no-store', signal:combined,
-    body: JSON.stringify({model,store:false,
-      input:[{type:'text',text:prompt+'\n\n'+guidance},{type:'video',uri:video.url}],
-      generation_config:{max_output_tokens:16000,thinking_level:'low'},response_format:analysisFormat}),
-  });
-  if (!response.ok) {
-    const reason=googleErrorDetail(await response.text().catch(() => ''));
-    console.warn(JSON.stringify({event:'analysis.refinement_unavailable',requestId,httpStatus:response.status,reason:reason.code,ms:Date.now()-started}));
-    return null;
-  }
-  const data=await response.json() as InteractionResponse;
-  if (data.status && data.status!=='completed') return null;
-  const output=extractInteractionText(data);
-  if (!output.trim()) return null;
-  const result=convert(decodeJson(output),video,model);
-  return {result, outputTokens:data.usage?.total_output_tokens??null, inputTokens:data.usage?.total_input_tokens??null, ms:Date.now()-started};
-}
 
-// This is a synchronous local-only PoC. Streaming *our own* status events lets
-// the UI show network activity, even when Google sends no intermediate tokens.
-// A provider-side % is not available; do not fabricate one.
 const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
 }
-export async function analyzeVideo(
-  video: VideoInfo,
-  requestId: string,
-  onProgress: (event: AnalysisProgress) => void,
-  signal?: AbortSignal,
-  depth: 'standard' | 'deep' = 'standard',
-): Promise<AnalysisRecord> {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new ServiceError('NOT_CONFIGURED', 'Google AI Studio 무료 등급 API 키가 필요합니다.', 503);
-  const model = FREE_MODEL;
-  const startedAll = Date.now();
-  const targets = detailTargets(video.durationSeconds);
-  const detailInstructions = `영상 ${video.durationSeconds}초 분석 목표: 근거가 충분하다면 핵심 요약 ${targets.summary}~${targets.summary+2}항목, 세부 타임라인 ${targets.timeline}~${targets.timeline+5}항목, 상세 아티클 ${targets.article}~${targets.article+3}개 소제목으로 작성하세요. 각 요약 항목은 2~4문장, 타임라인은 구간마다 2~4문장, 아티클 소제목별 2~4문단으로 작성하세요. 같은 주장만 반복하지 말고 원본에 실제 등장한 서로 다른 내용으로 구성하세요. 영상에서 이만큼의 뚜렷한 내용을 확인할 수 없다면 숫자를 억지로 맞추지 말고 줄이세요. 짧더라도 사실과 영상 근거가 최우선입니다.`;
-
-  // Bound the maximum wait instead of leaving the UI in a permanent spinner.
-  const timeoutMs = [110_000, 75_000];
-  let lastError: unknown;
-  for (let attempt = 0; attempt < timeoutMs.length; attempt++) {
-    if (signal?.aborted) throw new ServiceError('CANCELLED', '분석이 중단되었습니다.', 499);
-    const started = Date.now();
-    onProgress({type: 'progress', step: 2, attempt: attempt + 1, label: attempt ? '무료 AI 다시 연결 중' : 'Gemini 영상 분석 중', detail: attempt ? '일시적인 연결 오류로 마지막 한 번만 다시 시도합니다.' : '영상의 길이에 따라 다소 시간이 걸립니다. 실제 AI 내부 진행률은 제공되지 않습니다.'});
+async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string}) {
+  const timeout=AbortSignal.timeout(args.timeoutMs);
+  const signal=args.signal?AbortSignal.any([args.signal,timeout]):timeout;
+  const started=Date.now();
+  const response=await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+    method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':args.key},
+    cache:'no-store',signal,
+    body:JSON.stringify({model:args.model,store:false,input:args.input,generation_config:{max_output_tokens:16000,thinking_level:args.model==='gemini-3.8-flash'?'medium':'low'},response_format:args.format}),
+  });
+  if(!response.ok){
+    const detail=googleErrorDetail(await response.text().catch(() => ''));
+    console.error(JSON.stringify({event:'ai.http_error',requestId:args.requestId,model:args.model,pass:args.pass,httpStatus:response.status,providerReason:detail.code,ms:Date.now()-started}));
+    const msg=googleErrorMessage(response.status,detail);
+    if(response.status===429)throw new ServiceError('FREE_LIMIT',msg,429);
+    if([400,401,403,404].includes(response.status))throw new ServiceError('GOOGLE_REQUEST_REJECTED',msg,502);
+    if(!transientHttp.has(response.status))throw new ServiceError('PROVIDER_UNAVAILABLE',msg,502);
+    throw new ServiceError('TEMPORARY_HTTP',msg,502);
+  }
+  const data=await response.json() as InteractionResponse;
+  if(data.status && data.status!=='completed')throw new ServiceError('INTERACTION_STATUS',`Gemini 응답 상태: ${data.status}. 완료된 결과를 받지 못했습니다.`,502);
+  const output=extractInteractionText(data);
+  if(!output.trim())throw new ServiceError('INVALID_RESULT','Gemini 분석 결과가 비어 있습니다.',502);
+  let parsed:unknown;
+  try { parsed=decodeJson(output); }catch{throw new ServiceError('INVALID_RESULT',`${args.pass}: Gemini가 유효한 JSON을 생성하지 못했습니다.`,502);}
+  return {parsed,tokens:{input:data.usage?.total_input_tokens??null,output:data.usage?.total_output_tokens??null},ms:Date.now()-started};
+}
+function recordFromContent(video:VideoInfo,model:string,evidence:Evidence[],content:AnalysisContent):AnalysisRecord {
+  const now=new Date().toISOString();
+  return {id:crypto.randomUUID(),video,createdAt:now,updatedAt:now,model,evidence,original:content,edited:structuredClone(content)};
+}
+async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal):Promise<AnalysisRecord>{
+  onProgress({type:'progress',step:2,attempt:1,label:'1/2 · 영상 근거 추출',detail:'영상의 발언·주제 변화·근거 시점을 확인하고 있습니다. AI 내부 진행률은 알 수 없습니다.'});
+  let stage1;
+  try {
+    stage1=await interaction({key,model,requestId,pass:'source-map',format:sourceResponseFormat,input:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],signal,timeoutMs:125000});
+  } catch(error){
+    if(isTimeout(error))throw new ServiceError('TIMEOUT','영상 근거 추출 시간이 초과됐습니다. 짧은 영상으로 다시 시험해주세요.',504);
+    throw error;
+  }
+  let source;
+  try { source=parseSourceMap(stage1.parsed,video); }
+  catch(error){throw new ServiceError('INVALID_SOURCE_MAP',error instanceof Error?error.message:'원본 근거를 추출하지 못했습니다.',502);}
+  onProgress({type:'progress',step:3,attempt:2,label:'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
+  let content:AnalysisContent;
+  let composed=false;
+  let stage2tokens:null|{input:number|null;output:number|null}=null;
+  try {
+    // Pass 2 is text only. No second video ingestion and no ability to add source claims.
+    const stage2=await interaction({key,model,requestId,pass:'compose',format:composedResponseFormat,input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],signal,timeoutMs:125000});
+    content=extractComposedContent(stage2.parsed,source);
+    composed=true;
+    stage2tokens=stage2.tokens;
+  } catch(error) {
+    if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+    // The first step has original, bounded evidence: show that source only,
+    // transparently labeled as a reduced result. Never fabricate the rest.
+    console.warn(JSON.stringify({event:'analysis.compose_fallback',requestId,model,code:error instanceof ServiceError?error.code:'INVALID_OR_TIMEOUT'}));
+    content=fallbackFromSource(source);
+    onProgress({type:'progress',step:3,label:'근거 추출 결과 제공',detail:'상세 문서 생성에 실패하여 1차 근거 요지를 안전하게 표시합니다.'});
+  }
+  const result=recordFromContent(video,model,source.evidence,content);
+  result.analysisMeta={depth:'deep',providerCalls:2,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length};
+  onProgress({type:'progress',step:4,label:'근거 연결 검사 완료',detail:'존재하는 근거 ID·시간 범위를 확인했습니다. 사실 일치는 원본 대조가 필요합니다.'});
+  const quality=assessDetail(content,video.durationSeconds);
+  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:2,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1.tokens.input,firstOutputTokens:stage1.tokens.output,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
+  return result;
+}
+export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL):Promise<AnalysisRecord>{
+  const key=process.env.GEMINI_API_KEY;
+  if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);
+  if(depth==='deep')return deepAnalysis(video,model,key,requestId,onProgress,signal);
+  const targets=detailTargets(video.durationSeconds);
+  const detailInstructions=`영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
+  const attempts=[110000,75000];let lastError:unknown;
+  for(let i=0;i<attempts.length;i++){
+    if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단됐습니다.',499);
+    onProgress({type:'progress',step:2,attempt:i+1,label:i?'일시적 오류 재시도':'기본 영상 분석',detail:'영상에서 근거를 찾고 한국어 결과물을 생성하고 있습니다.'});
     try {
-      const timeout = AbortSignal.timeout(timeoutMs[attempt]);
-      const fetchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        cache: 'no-store',
-        signal: fetchSignal,
-        body: JSON.stringify({
-          model,
-          store: false,
-          input: [
-            { type: 'text', text: prompt + `\n\n${detailInstructions}\n영상 길이: ${video.durationSeconds}초. ID: ${video.id}.` },
-            { type: 'video', uri: video.url },
-          ],
-          generation_config: { max_output_tokens: 16000, thinking_level: 'low' },
-          response_format: analysisFormat,
-        }),
-      });
-      if (!response.ok) {
-        const details = googleErrorDetail(await response.text().catch(() => ''));
-        console.error(JSON.stringify({event:'ai.http_error',requestId,model,attempt:attempt+1,httpStatus:response.status,providerReason:details.code,ms:Date.now()-started}));
-        const explanation = googleErrorMessage(response.status, details);
-        if (response.status === 429) throw new ServiceError('FREE_LIMIT', explanation, 429);
-        if ([400,401,403,404].includes(response.status)) throw new ServiceError('GOOGLE_REQUEST_REJECTED', explanation, 502);
-        if (!transientHttp.has(response.status)) throw new ServiceError('PROVIDER_UNAVAILABLE', explanation, 502);
-        throw new ServiceError('TEMPORARY_HTTP', explanation, 502);
-      }
-      const data = await response.json() as InteractionResponse;
-      // The synchronous API can still return a nonterminal status. Do not
-      // mistake it for a completed analysis or blindly retry a running job.
-      if (data.status && data.status !== 'completed') {
-        const failure = ['failed','cancelled','incomplete','requires_action','in_progress','queued'].includes(data.status);
-        if (failure) throw new ServiceError('INTERACTION_STATUS', `Gemini 응답 상태: ${data.status}${data.error?.message ? ` · ${googleErrorDetail(JSON.stringify({error:{status:data.error.code,message:data.error.message}})).detail}` : ''}. 완료된 결과를 받지 못했습니다.`, 502);
-      }
-      const output = extractInteractionText(data);
-      if (!output.trim()) throw new ServiceError('INVALID_RESULT', 'Gemini 응답에서 분석 본문을 찾지 못했습니다. 영상 접근 또는 출력 한도를 확인해주세요.', 502);
-      onProgress({type: 'progress',step: 3,label: 'AI 응답 수신',detail: '분석 내용을 받았습니다. 구조와 시간 근거를 확인하고 있습니다.'});
-      let parsed: unknown;
-      try { parsed = decodeJson(output); }
-      catch { throw new ServiceError('INVALID_RESULT','Gemini 응답이 유효한 JSON이 아닙니다. 출력 토큰 한도를 확인해주세요.',502); }
-      let result = convert(parsed, video, model);
-      let extraCall = false;
-      let improvement = false;
-      // Max two provider calls overall: a retry replaces the refinement call.
-      if (depth === 'deep' && attempt === 0 && needsDeepening(result.original, video.durationSeconds)) {
-        extraCall = true;
-        onProgress({type:'progress',step:3,attempt:2,label:'정밀 분석 · 영상 다시 검토',detail:'첫 결과의 빠진 논점과 근거를 다시 살피고 있습니다. 두 번째 무료 AI 호출을 사용합니다.'});
-        try {
-          const candidate = await deepenAnalysis(video, result, key, model, signal, requestId);
-          if (candidate && qualityDensityScore(candidate.result.original,video.durationSeconds)>qualityDensityScore(result.original,video.durationSeconds)) {
-            result=candidate.result;
-            improvement=true;
-          }
-          console.info(JSON.stringify({event:'analysis.refinement_done',requestId,improved:improvement,extraOutputTokens:candidate?.outputTokens??null,extraInputTokens:candidate?.inputTokens??null,ms:candidate?.ms??null}));
-        } catch (refineError) {
-          if (signal?.aborted) throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
-          // Preserve the valid first pass when the optional second pass fails.
-          console.warn(JSON.stringify({event:'analysis.refinement_failed',requestId,code:refineError instanceof ServiceError?refineError.code:'INVALID_OR_TIMEOUT'}));
-          onProgress({type:'progress',step:3,label:'첫 분석 결과 사용',detail:'추가 검토를 완료하지 못했으므로 정상 생성된 첫 결과를 사용합니다.'});
-        }
-      }
-      onProgress({type:'progress',step:4,label:'영상 근거 검증 완료',detail:'분석 결과를 브라우저로 전달합니다.'});
-      result.analysisMeta={depth,providerCalls:attempt+1+(extraCall?1:0),refinement:extraCall?(improvement?'improved':'kept-first'):'not-needed'};
-      const assessment = assessDetail(result.original, video.durationSeconds);
-      console.info(JSON.stringify({event:'analysis.completed',requestId,model,attempts:attempt+1,providerCalls:attempt+1+(extraCall?1:0),deepMode:depth==='deep',improved:improvement,ms:Date.now()-startedAll,inputTokens:data.usage?.total_input_tokens??null,outputTokens:data.usage?.total_output_tokens??null,contentMetrics:assessment.counts,shortFields:assessment.shortFields}));
+      const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'text',text:prompt+'\n'+detailInstructions},{type:'video',uri:video.url}],signal,timeoutMs:attempts[i]});
+      const result=convert(response.parsed,video,model);
+      result.analysisMeta={depth:'standard',providerCalls:i+1,refinement:'not-needed',pipeline:'single-pass'};
+      onProgress({type:'progress',step:4,label:'결과 구조 검증 완료',detail:'영상 근거 구조와 시간 범위를 확인했습니다.'});
+      const quality=assessDetail(result.original,video.durationSeconds);
+      console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'standard',providerCalls:i+1,tokens:response.tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
       return result;
-    } catch(error) {
-      if (signal?.aborted) throw new ServiceError('CANCELLED','사용자가 분석을 중단했습니다.',499);
-      const timedOut = isTimeout(error);
-      lastError = timedOut ? new ServiceError('TIMEOUT',`Gemini 응답이 ${Math.round(timeoutMs[attempt]/1000)}초 안에 완료되지 않았습니다. 짧은 영상으로 먼저 확인하거나 나중에 다시 시도해주세요.`,504) : error;
-      const code = lastError instanceof ServiceError ? lastError.code : 'TRANSIENT_ERROR';
-      console.error(JSON.stringify({event:'analysis.attempt_failed',requestId,model,attempt:attempt+1,ms:Date.now()-started,code}));
-      // Bad video / rate limits / malformed response are not helped by retrying.
-      if (lastError instanceof ServiceError && !['TIMEOUT','TEMPORARY_HTTP'].includes(lastError.code)) throw lastError;
-      if (attempt === 0) {
-        onProgress({type:'progress',step:2,attempt:2,label:'일시적 오류 재시도 준비',detail:'첫 요청이 실패했습니다. 같은 무료 모델로 마지막 한 번만 재시도합니다.'});
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
+    }catch(error){
+      if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단됐습니다.',499);
+      lastError=isTimeout(error)?new ServiceError('TIMEOUT','영상 분석 시간이 초과됐습니다.',504):error;
+      if(!(lastError instanceof ServiceError)||!['TEMPORARY_HTTP','TIMEOUT'].includes(lastError.code)||i===1)break;
     }
   }
-  throw lastError instanceof ServiceError ? lastError : new ServiceError('PROVIDER_UNAVAILABLE',lastError instanceof Error?`Gemini 연결 실패: ${lastError.message.slice(0,200)}`:'무료 AI 분석에 실패했습니다.',502);
+  throw lastError instanceof ServiceError?lastError:new ServiceError('PROVIDER_UNAVAILABLE',lastError instanceof Error?lastError.message:'분석 요청에 실패했습니다.',502);
 }

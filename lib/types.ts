@@ -6,7 +6,7 @@ export type VideoInfo = { id: string; title: string; channel: string; thumbnail:
 export type AnalysisRecord = {
   id: string; video: VideoInfo; createdAt: string; updatedAt: string; model: string;
   evidence: Evidence[]; original: AnalysisContent; edited: AnalysisContent;
-  analysisMeta?: { depth: 'standard' | 'deep'; providerCalls: number; refinement: 'improved' | 'kept-first' | 'not-needed' };
+  analysisMeta?: { depth: 'standard' | 'deep'; providerCalls: number; refinement: 'improved' | 'kept-first' | 'not-needed'; pipeline?: 'single-pass' | 'evidence-compose'; sourceClaims?: number; sourceEvidence?: number };
 };
 export type ApiError = { error: string; code?: string; remaining?: number };
 export type QuotaInfo = { remaining: number; completed: number; reserved: number; limit: number; enabled: boolean; reason?: string };

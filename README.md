@@ -1,11 +1,11 @@
-# YouTube AI Analyzer · 개인용 무료 등급 PoC v1.2
+# YouTube AI Analyzer · 개인용 무료 등급 PoC v1.6
 
 이 저장소는 PRD v1.0 기반 Next.js 16 App Router / React 19 / TypeScript / Tailwind CSS 개인 테스트 앱입니다.
 
 ## 무엇이 바뀌었나요?
 
 - Redis, DB, 로그인, 익명 쿠키 및 서버 측 하루 3회 분석 제한을 **완전히 제거**했습니다.
-- Gemini Interactions API의 공개 YouTube URL 미리보기 입력을 사용합니다. 모델 ID는 코드에서 `gemini-3.5-flash-lite`로 고정합니다.
+- Gemini Interactions API의 공개 YouTube URL 미리보기 입력을 사용합니다. 무료 모델 `gemini-3.8-flash`와 `gemini-3.5-flash-lite` 중 직접 선택할 수 있습니다. 정밀 분석은 근거 추출·상세 작성 2단계로 처리합니다.
 - **결제 미연결 Free Tier 프로젝트**의 키만 사용하도록 운영자가 직접 확인하고 승인해야 합니다. 모델의 무료 사용 가능성과 계정의 결제 상태는 서로 다릅니다.
 - AI 분석 API와 YouTube 조회 API는 `next dev`의 `localhost` 요청에서만 동작합니다. 프로덕션에서는 분석이 자동 비활성화됩니다.
 - 결과는 기존 IndexedDB에 저장하며 수정·원본 복원·복사·MD/TXT/PDF/DOCX 내보내기를 그대로 지원합니다.
@@ -106,3 +106,17 @@ npm run dev -- --hostname 127.0.0.1
 - `analysis.completed` 로그에 `providerCalls`, `deepMode`, `improved`, `contentMetrics`를 출력하여 품질 개선 여부를 비교할 수 있습니다. 콘텐츠 본문, API 키는 로그에 남기지 않습니다.
 - 새 정책은 **다시 분석한 결과부터 적용**됩니다. 저장된 기존 결과, IndexedDB, 편집, 문서 내보내기는 바꾸지 않습니다.
 - 정밀 모드의 경우 무료 AI 요청 수와 영상 입력 사용량이 늘 수 있으며 30분 영상은 완료 시간이 더 길어질 수 있습니다. 비동기 워커가 없으므로 장시간 분석 제한은 여전히 존재합니다.
+
+## v1.6 · 근거 우선 2단계 분석 및 무료 모델 비교 (v9)
+
+- 사용자가 **Gemini 3.8 Flash**(권장)와 **3.5 Flash-Lite**(기존)를 직접 선택합니다. 공식 표준 Free Tier 가격표의 모델만 코드에서 허용합니다. 사용자 프로젝트의 실제 접근 권한과 무료 할당량은 Google AI Studio에서 확인해야 합니다.
+- **기본 분석**은 영상 입력 + 결과 생성 1회입니다. **정밀 분석**은 근거 추출용 영상 호출 1회와, 추출 근거만 입력으로 전달하는 텍스트 기반 상세 아티클 작성 호출 1회로 나눕니다. 최대 두 호출, 유료 자동 전환 없음.
+- 1단계는 시간 근거(evidence), 각각의 개별 주장(claims), 확인된 발화가 있을 때만 전사(transcript)를 확보합니다.
+- 2단계는 1단계 `claimIds`와 `evidenceIds`에 연결된 설명만 생성합니다. 임의의 새 구간이나 출처 ID는 허용하지 않습니다. 단, 코드 수준 구조 검사는 실제 영상의 의미적 진실성을 보증하지 않으므로 중요한 내용을 원본 영상에서 확인해야 합니다.
+- 2단계가 실패할 경우 **상세 해설인 것처럼 꾸미지 않고 1차 근거 요지**를 표시합니다. 생성된 내용과 원본 사실은 구별하며, 발화 확인이 불가능한 스크립트는 비워 둡니다.
+- 기존 IndexedDB 결과·편집·내보내기를 유지하며, 이전 기록은 덮어쓰지 않습니다. 같은 영상에서 새 분석을 실행해야 v9 파이프라인을 적용합니다.
+- 로컬 전용 안전장치와 `GEMINI_FREE_TIER_CONFIRMED=true` 수동 승인은 유지합니다. 이 값은 Google Cloud Billing 상태를 확인하지 못하며 **과금 방지 기술적 보증이 아닙니다**. 결제 미연결 Free Tier 프로젝트만 사용하세요.
+- 진단 버튼은 선택한 모델 메타데이터만 조회하며 추론 호출을 실행하지 않습니다.
+- `GET /api/ai-diagnostics?model=gemini-3.8-flash`도 지원합니다. Gemini 3.8 Flash는 `thinking_level: medium`, 3.5 Flash-Lite는 `low`로 요청합니다. 모델별 요청량과 무료 한도 소진(429)을 주의하세요.
+
+자세한 사항은 `docs/PRD-v1.6-evidence-pipeline.md`를 참고하세요.

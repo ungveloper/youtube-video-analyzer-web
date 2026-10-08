@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { extractVideoId } from '@/lib/youtube';
 import { analyzeVideo } from '@/lib/server/ai';
 import { getVideo, ServiceError } from '@/lib/server/video';
-import { assertPersonalRequest, assertSameOrigin, personalModeStatus } from '@/lib/server/personal-mode';
+import { assertPersonalRequest, assertSameOrigin, personalModeStatus, freeModelId } from '@/lib/server/personal-mode';
 import type { AnalysisEvent, AnalysisProgress } from '@/lib/analysis-stream';
 
 export const runtime = 'nodejs';
@@ -17,10 +17,12 @@ export async function POST(request: Request) {
     assertSameOrigin(request);
     const status = personalModeStatus();
     if (!status.enabled) throw new ServiceError('NOT_CONFIGURED', status.reason, 503);
-    const body = await request.json() as { videoId?: unknown; requestId?: unknown; depth?: unknown };
+    const body = await request.json() as { videoId?: unknown; requestId?: unknown; depth?: unknown; model?: unknown };
     const videoId = typeof body.videoId === 'string' ? extractVideoId(body.videoId) : null;
     const requestId = typeof body.requestId === 'string' && /^[a-f0-9-]{36}$/i.test(body.requestId) ? body.requestId : null;
     const depth = body.depth === 'deep' ? 'deep' : 'standard';
+    const model = freeModelId(body.model);
+    if (!model) throw new ServiceError('INVALID_MODEL', '무료 등급 허용 목록에 없는 AI 모델입니다.', 400);
     if (!videoId || !requestId) throw new ServiceError('INVALID_REQUEST', '잘못된 분석 요청입니다.', 400);
     if (activeAnalysis) throw new ServiceError('ACTIVE_JOB', '이미 진행 중인 분석이 있습니다. 이전 작업을 완료하거나 중단해주세요.', 409);
 
@@ -51,7 +53,7 @@ export async function POST(request: Request) {
             const video = await getVideo(videoId);
             emit({type:'progress', step:2,label:'영상 확인 완료',detail:'무료 Gemini 모델에 영상 URL을 전달할 준비가 되었습니다.'});
             const onProgress = (event: AnalysisProgress) => emit(event);
-            const result = await analyzeVideo(video, requestId, onProgress, abortController.signal, depth);
+            const result = await analyzeVideo(video, requestId, onProgress, abortController.signal, depth, model);
             emit({type:'completed', analysis: result});
           } catch(error) {
             const code = error instanceof ServiceError ? error.code : 'ANALYSIS_ERROR';
