@@ -1,4 +1,4 @@
-# YouTube AI Analyzer · 개인용 무료 등급 PoC v1.1
+# YouTube AI Analyzer · 개인용 무료 등급 PoC v1.2
 
 이 저장소는 PRD v1.0 기반 Next.js 16 App Router / React 19 / TypeScript / Tailwind CSS 개인 테스트 앱입니다.
 
@@ -57,3 +57,22 @@ npm run dev -- --hostname 127.0.0.1
 ## npm 보안 점검
 
 이 패치는 package.json/lock 버전 변경을 포함하지 않습니다. 설치된 의존성은 Mac에서 `npm audit --omit=dev` 및 `npm audit`로 확인해주세요. `npm audit fix --force`는 호환성 검토 전에 실행하지 마세요.
+
+## v1.2 · 분석 대기 및 오류 진단 개선
+
+- `분석 요청 처리 중…` 상태에 회전 스피너, 경과 시간, **단계 진행률** 표시.
+- 단계 진행률은 **애플리케이션에서 완료된 단계** (요청 수신 10%, 영상 확인/AI 실행 30%, 모델 응답 수신 75%, 검증 90%, 브라우저 저장 완료 100%)만 나타냅니다. Gemini 내부 처리율은 확인할 수 없어 분석 중 숫자가 오래 유지될 수 있습니다.
+- `POST /api/analyze`는 `text/event-stream` 으로 `progress`, `completed`, `failed` 이벤트를 보냅니다. 작업 중에는 5초마다 연결 유지용 heartbeat를 전송합니다.
+- 분석 취소 버튼은 브라우저 요청을 중단하며, 가능한 경우 업스트림 API fetch도 취소합니다. 취소 시 외부 제공자 측 요청량은 반환되지 않을 수 있습니다.
+- AI 요청은 최대 110초 + 복구 가능한 오류에 대해 추가 75초로 제한합니다. 합계 약 3분 내 응답 및 후처리를 시도하지만 로컬 환경, 업스트림 상태에 따라 오차가 있습니다.
+- `429`(무료 한도), `400`·`401`·`403`·`404`(설정/영상/모델 불가), 미완료 응답, JSON 형식 오류는 **자동 재시도하지 않습니다**. `408`·일시적 `5xx`·응답 시간 초과 등만 최대 1회 재시도합니다.
+- 실패 시 사용자에게 에러 분류 코드, Google API HTTP 상태 및 요청 ID 일부를 표시하며, 터미널에는 `analysis.failed` 및 `ai.http_error` 로그를 남깁니다. **API 키는 로그에 쓰지 않습니다.**
+- Next.js 16의 smooth-scroll 경고는 `app/layout.tsx`의 `data-scroll-behavior="smooth"` 속성으로 해결합니다.
+
+### 분석이 완료되지 않는 경우
+
+1. 단순 점검은 1~3분짜리 짧은 공개 영상에서 먼저 테스트하세요.
+2. 로컬 터미널에서 `ai.http_error`, `analysis.attempt_failed`, `analysis.failed` 이벤트를 확인하세요.
+3. 오류 코드와 HTTP 상태만 공유하세요. `.env.local` 값, API 키, 요청/응답 원문을 공유하지 마세요.
+4. 입력/모델/API 자체가 지원되지 않는다면 UI를 수정해도 자동 분석을 보장할 수 없습니다. Gemini 무료 등급 계정과 해당 모델의 YouTube URL 지원 여부를 점검해야 합니다.
+5. 데이터베이스와 Redis는 여전히 사용하지 않으며, 완료된 결과는 브라우저 IndexedDB에만 저장합니다.
