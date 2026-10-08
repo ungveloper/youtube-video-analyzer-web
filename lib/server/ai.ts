@@ -4,12 +4,28 @@ import { ServiceError } from '@/lib/server/video';
 import { FREE_MODEL } from '@/lib/server/personal-mode';
 import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
-const prompt=`너는 YouTube 공개 영상을 한국어로 분석하는 근거 기반 분석기다.
-규칙: 반드시 실제로 입력된 영상에서 검증 가능한 내용만 출력하라. 제목/설명만 보고 영상 내용을 추측하지 마라. 핵심 주장 하나마다 증거 구간 evidenceIds를 붙여라. 시간은 실제 영상 길이 내 초 단위. 근거 없는 주장/불확실한 수치/작은 글씨는 결과에서 제외하고 exclusions에 간략히 알려라. 모든 출력은 한국어로. 아티클은 이해하기 쉬운 상세 해설형으로 작성하되 외부 지식과 만들어낸 사례를 섞지 마라.
-스크립트는 실제 원문 발화 자료를 충분히 확신할 수 있고 원문과 정확하게 일치하도록 추출할 수 있는 경우에만 작성하라. 외국어 원문을 확보했다면 문장을 한국어로 번역하고 translated=true로 설정하라. 실제 전사가 불가능하면 transcript=[] 로 둬라. 영상의 대사 전체를 상상해서 생성하지 마라.
-JSON 한 개만 출력. 필수 스키마:
-{"evidence":[{"id":"ev1","startSeconds":0,"endSeconds":10,"kind":"video","note":"관찰 근거"}],"summary":[{"id":"s1","text":"핵심 내용","evidenceIds":["ev1"]}],"timeline":[{"id":"t1","title":"주제","text":"상세 설명","evidenceIds":["ev1"]}],"article":[{"id":"a1","title":"소제목","text":"상세 해설 문단","evidenceIds":["ev1"]}],"transcript":[{"id":"tr1","startSeconds":0,"endSeconds":4,"text":"실제 확인한 발언 또는 번역","translated":false}],"exclusions":["확인할 수 없어 제외한 항목"]}
-원문 스크립트가 없으면 transcript=[]로 반드시 표시. summary, timeline, article는 근거가 있는 경우에만 작성하라. 완성된 JSON 외에 어떤 문장도 출력하지 마라.`;
+import { assessDetail, detailTargets } from '@/lib/analysis-detail';
+// Single-call, source-grounded editorial instructions. Detail varies with video length;
+// targets are aspirational and must never override source accuracy.
+const prompt = `너는 교육·지식 콘텐츠 전문 한국어 영상 분석 편집자다. 입력한 YouTube 영상 자체를 분석하여 사용자가 영상 없이도 논지, 설명 과정, 구체적인 근거를 이해할 수 있는 고밀도 해설을 작성한다.
+
+절대 원칙:
+- 반드시 입력 영상에서 실제 확인할 수 있는 정보만 사용한다. 영상 제목·썸네일·설명만으로 내용을 상상하거나 일반 상식으로 문단을 채우지 않는다.
+- 수치·인물·증상·의학/법률/금융적 효과·인과관계는 영상 속 발화/장면으로 확인할 때만 명시한다. 발표자의 주장과 객관적으로 검증된 사실을 구별한다.
+- 설명되지 않은 외부 사실, 추측 사례, 근거 없는 도표, 통계, 임의 타임스탬프를 생성하지 않는다.
+- 동일 내용을 다른 표현으로 늘어놓지 않는다. 반복 발언은 한 번 정리하되 서로 다른 논점은 누락하지 않는다.
+- 모든 요약 항목/타임라인 항목/아티클 소제목에는 실제 영상 구간의 evidenceIds를 1개 이상 연결한다. 근거 시간은 0초~영상 길이 범위 내 실제 장면/발화에 가깝게 한다. 근거를 못 찾으면 해당 주장은 제외한다.
+
+진행 방식:
+1) 전체 영상을 시작부터 끝까지 따라가며 발화/화면에 등장한 주장, 예시, 정의, 경고, 결론과 주제 변화 지점을 찾는다.
+2) evidence 배열에 확인 가능한 구간을 기록한다. 한 구간을 여러 주장에 재사용해도 된다. 실제 장면 시각과 다르게 시간을 채우기 위해 구간을 쪼개지는 않는다.
+3) summary는 **서로 구분되는 핵심 주장**별 항목 목록으로 작성한다. text 각각 2~4문장으로 '무엇을 말했는지 / 영상에서 어떻게 설명했는지'를 담는다. 하나의 summary 항목에 전체 영상을 압축하지 않는다.
+4) timeline은 시간순으로 주제 전환, 새로운 주장, 예시 및 결론을 최대한 촘촘하게 나눈다. title은 고유한 주제, text는 그 순간의 실제 내용과 설명 흐름을 2~4문장으로 구체적으로 설명한다. 단순 '소개·설명·마무리' 등의 제목만 반복하지 않는다.
+5) article은 짧은 요약문이 아니라 영상에 기반한 **독립적으로 읽기 쉬운 상세 해설 아티클**이다. 도입→개념/문제→세부 논거·사례→주의점·결론의 실제 순서를 따르고, 소제목별 text에는 2~4개 문단(문단 사이 \n\n), 문단별 2~4문장 정도의 충분한 해설을 작성한다. 영상에 내용이 부족한 소제목은 짧게 유지한다. 영상에서 쓰는 용어를 설명하되 외부 사실을 섞지 않는다.
+6) transcript는 원본 발화를 정확히 확인할 수 있는 경우에만 작성한다. 외국어 발화는 원문을 확보한 경우 한국어 번역과 translated=true. 정확한 전사/발화 시점을 확인할 수 없으면 []로 비운다. 영상 대사를 추측하여 구성하거나 요약문을 스크립트라고 부르지 않는다.
+7) exclusions에는 확인할 수 없는 주요 정보/제약만 구체적으로 적는다. 특별히 없으면 []로 둔다. 상투적인 면책 문구로 길이를 채우지 않는다.
+
+모든 출력은 한국어로, JSON 객체 한 개만 출력한다. summary/timeline/article는 각각 서로 구별되는 내용을 충분한 항목으로 작성한다. 제공된 JSON Schema 구조를 따른다.`;
 export type InteractionResponse = {
   steps?: Array<{type?:string; content?:Array<{type?:string;text?:string}>}>;
   output_text?: string;
@@ -61,6 +77,9 @@ export async function analyzeVideo(
   if (!key) throw new ServiceError('NOT_CONFIGURED', 'Google AI Studio 무료 등급 API 키가 필요합니다.', 503);
   const model = FREE_MODEL;
   const startedAll = Date.now();
+  const targets = detailTargets(video.durationSeconds);
+  const detailInstructions = `영상 ${video.durationSeconds}초 분석 목표: 근거가 충분하다면 핵심 요약 ${targets.summary}~${targets.summary+2}항목, 세부 타임라인 ${targets.timeline}~${targets.timeline+5}항목, 상세 아티클 ${targets.article}~${targets.article+3}개 소제목으로 작성하세요. 각 요약 항목은 2~4문장, 타임라인은 구간마다 2~4문장, 아티클 소제목별 2~4문단으로 작성하세요. 같은 주장만 반복하지 말고 원본에 실제 등장한 서로 다른 내용으로 구성하세요. 영상에서 이만큼의 뚜렷한 내용을 확인할 수 없다면 숫자를 억지로 맞추지 말고 줄이세요. 짧더라도 사실과 영상 근거가 최우선입니다.`;
+
   // Bound the maximum wait instead of leaving the UI in a permanent spinner.
   const timeoutMs = [110_000, 75_000];
   let lastError: unknown;
@@ -80,20 +99,20 @@ export async function analyzeVideo(
           model,
           store: false,
           input: [
-            { type: 'text', text: prompt + `\n영상 길이: ${video.durationSeconds}초. ID: ${video.id}. 실제 영상 근거가 불충분하면 해당 내용을 생성하지 마라.` },
+            { type: 'text', text: prompt + `\n\n${detailInstructions}\n영상 길이: ${video.durationSeconds}초. ID: ${video.id}.` },
             { type: 'video', uri: video.url },
           ],
-          generation_config: { max_output_tokens: 10000 },
+          generation_config: { max_output_tokens: 16000, thinking_level: 'low' },
           response_format: {
             type: 'text', mime_type: 'application/json',
             schema: {
               type: 'object',
               properties: {
-                evidence: { type: 'array', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind'] } },
-                summary: { type: 'array', items: { type: 'object', properties: {id: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','text','evidenceIds'] } },
-                timeline: { type: 'array', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
-                article: { type: 'array', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
-                transcript: { type: 'array', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
+                evidence: { type: 'array', description: '각 주장과 연결할 실제 영상 구간. 근거 없는 구간은 만들지 마세요.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind'] } },
+                summary: { type: 'array', description: '핵심 주장별 분리된 상세 요약 목록. 각 text는 여러 문장.', items: { type: 'object', properties: {id: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','text','evidenceIds'] } },
+                timeline: { type: 'array', description: '내용 변화 시점별 실제 세부 타임라인. 각 text는 2~4문장.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
+                article: { type: 'array', description: '긴 호흡의 해설 문서: 소제목별 여러 문단을 개행 두 번으로 구분.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
+                transcript: { type: 'array', description: '실제 원문 발화를 확인한 경우에만 작성. 확인 불가시 빈 배열.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
                 exclusions: {type: 'array', items: {type: 'string'}},
               }, required: ['evidence','summary','timeline','article','transcript','exclusions'],
             },
@@ -124,7 +143,8 @@ export async function analyzeVideo(
       catch { throw new ServiceError('INVALID_RESULT','Gemini 응답이 유효한 JSON이 아닙니다. 출력 토큰 한도를 확인해주세요.',502); }
       const result = convert(parsed, video, model);
       onProgress({type:'progress',step:4,label:'영상 근거 검증 완료',detail:'분석 결과를 브라우저로 전달합니다.'});
-      console.info(JSON.stringify({event:'analysis.completed',requestId,model,attempts:attempt+1,ms:Date.now()-startedAll,inputTokens:data.usage?.total_input_tokens??null,outputTokens:data.usage?.total_output_tokens??null}));
+      const assessment = assessDetail(result.original, video.durationSeconds);
+      console.info(JSON.stringify({event:'analysis.completed',requestId,model,attempts:attempt+1,ms:Date.now()-startedAll,inputTokens:data.usage?.total_input_tokens??null,outputTokens:data.usage?.total_output_tokens??null,contentMetrics:assessment.counts,shortFields:assessment.shortFields}));
       return result;
     } catch(error) {
       if (signal?.aborted) throw new ServiceError('CANCELLED','사용자가 분석을 중단했습니다.',499);
