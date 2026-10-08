@@ -1,81 +1,59 @@
-# YouTube AI Analyzer (PRD v1.0)
+# YouTube AI Analyzer · 개인용 무료 등급 PoC v1.1
 
-Next.js 16 App Router / React 19 / Tailwind CSS 4 / TypeScript. 다크 모드 중심, 데스크톱 영상+분석 좌우 분할, 모바일 상하 배치.
+이 저장소는 PRD v1.0 기반 Next.js 16 App Router / React 19 / TypeScript / Tailwind CSS 개인 테스트 앱입니다.
 
-> **내부 기술 검증 단계.** YouTube Data API는 공개 영상의 제목·길이 등을 제공하지만 제3자 영상의 자막 전문을 자유롭게 제공하지 않습니다. 분석 URL 직접 입력을 지원하는 AI 제공자 설정 없이는 실제 AI 분석이 작동하지 않습니다. 무단 다운로드·스크래핑 코드는 포함하지 않았습니다.
+## 무엇이 바뀌었나요?
 
-## 구현된 기능
+- Redis, DB, 로그인, 익명 쿠키 및 서버 측 하루 3회 분석 제한을 **완전히 제거**했습니다.
+- Gemini Interactions API의 공개 YouTube URL 미리보기 입력을 사용합니다. 모델 ID는 코드에서 `gemini-3.5-flash-lite`로 고정합니다.
+- **결제 미연결 Free Tier 프로젝트**의 키만 사용하도록 운영자가 직접 확인하고 승인해야 합니다. 모델의 무료 사용 가능성과 계정의 결제 상태는 서로 다릅니다.
+- AI 분석 API와 YouTube 조회 API는 `next dev`의 `localhost` 요청에서만 동작합니다. 프로덕션에서는 분석이 자동 비활성화됩니다.
+- 결과는 기존 IndexedDB에 저장하며 수정·원본 복원·복사·MD/TXT/PDF/DOCX 내보내기를 그대로 지원합니다.
+- 무료 API 한도 소진(HTTP 429) 시 재시도하거나 유료 모델로 자동 전환하지 않습니다.
 
-- YouTube ID, `watch`, `youtu.be`, Shorts, embed URL 식별 및 공개 상태·최대 30분 검증
-- 공식 YouTube 임베드 플레이어, 타임스탬프 이동, 반응형 다크 UI
-- 한국어 요약/타임라인/상세 아티클/원문 확보 시 번역 스크립트, 근거 링크와 제외 안내
-- 모든 분석 결과 직접 편집, 최초 분석 원본 복원, 자동 저장 (브라우저 IndexedDB)
-- 최근 기록 및 재열람/검색/삭제, 결과 전체 복사와 Markdown/TXT/PDF/DOCX 다운로드
-- 서버 측 익명 쿠키 및 Redis 원자적 무료 횟수 예약 (한국 시간 기준 하루 3회), 중복 요청 방지, 일시 오류 재시도 1회
-- 전체 일일 요청 및 처리 초 상한, 중단 스위치, 모델별 교체 가능한 기본/대체 설정, 구조화된 사용량 로그
-- 관리자 페이지·로그인·서버 영구 보관·공유 링크 없음
+## 꼭 필요한 3개 설정
 
-## 초기 설정
+1. [Google Cloud](https://console.cloud.google.com/)에서 YouTube Data API v3를 활성화하고 `YOUTUBE_API_KEY`를 받습니다. (기존 키가 있다면 계속 사용 가능.) 영상 길이(최대 30분) 검증에 사용합니다.
+2. [Google AI Studio](https://aistudio.google.com/app/apikey)에서 **Cloud Billing이 연결되지 않은 무료 등급 프로젝트**로 Gemini API 키를 생성합니다. `GEMINI_API_KEY`에 넣습니다. 결제가 연결된 다른 프로젝트 키를 복사하지 마세요.
+3. Google AI Studio에서 해당 프로젝트가 Free Tier임을 직접 재확인한 뒤 `GEMINI_FREE_TIER_CONFIRMED=true`로 변경합니다. 코드에서 과금 등급을 검증할 수 없으므로 이 값은 실수 방지를 위한 **수동 승인 플래그이지 과금 차단 보증은 아닙니다.**
 
 ```bash
-npm ci
-cp .env.example .env.local
-# 아래 환경변수를 설정
-npm run dev
+cd /Users/ungveloper/Desktop/UNG/youtube-video-analyzer-web
+cp -n .env.example .env.local
+# .env.local을 텍스트 편집기로 열어 3개 값을 설정
+npm run dev -- --hostname 127.0.0.1
 ```
 
-`.env.local`은 절대로 Git에 Push하지 마세요. `.env.example`을 참조합니다.
+`http://localhost:3000` 대신 `http://127.0.0.1:3000`으로 접속합니다. `npm run dev`에서 변경된 .env.local을 적용하려면 서버를 재시작하세요. `GEMINI_FREE_TIER_CONFIRMED=false`이면 AI 요청이 비활성화됩니다. `.env.local`에는 비밀 API 키가 들어 있으므로 절대 Git에 커밋하지 마세요.
 
-필수:
+### 무료라고 해서 무조건 과금이 차단되지는 않습니다
 
-1. `YOUTUBE_API_KEY`: YouTube Data API v3를 활성화한 Google Cloud 프로젝트의 서버 API 키. 가능하다면 API 제한을 적용하십시오.
-2. `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`: Upstash Redis REST 연결.
-3. `GEMINI_API_KEY`: **선택적으로 활성화할 수 있는 PoC 제공자**. 현재 구현에서 공개 YouTube URL을 직접 분석하는 실제 API 제공자는 이것뿐입니다. 반드시 제공자의 무료 한도, 데이터 이용 및 상업적 이용 조건을 사전에 검토하세요. API 키가 없다면 UI만 테스트되고 분석은 차단됩니다.
-4. `QUOTA_HASH_SECRET`: **필수**. 임의의 긴 비밀값으로 IP를 일방향 해시하고 요청 제한에 사용합니다.
+- Gemini 모델의 **Free Tier 가격은 0달러**이지만, **Paid Tier API 키**를 사용하면 해당 등급의 청구가 적용될 수 있습니다. **API 호출만으로 키가 어떤 결제 등급인지 확실히 확인할 방법은 제공하지 않습니다.** 과금 없는 이용을 위해 프로젝트에 Cloud Billing을 연결하지 마세요.
+- 무료 티어 요청/토큰 제한은 AI Studio에 표시되는 실제 계정의 한도에 따릅니다. API가 HTTP 429를 반환하면 분석을 멈춥니다.
+- 공개 YouTube URL 직접 입력은 Google 공식 문서에서 무료 미리보기로 안내되지만, 한도 및 정책은 변경될 수 있습니다(무료 등급 YouTube 입력 최대 8시간/일).
+- 무료 등급 데이터는 Google의 제품 개선에 이용될 수 있습니다. `store:false`는 Interactions API 대화 상태 저장을 비활성화하며, 무료 등급의 데이터 처리 조건 전체를 무효화하지는 않습니다.
+- 로컬 머신의 전기요금/네트워크 사용량과 YouTube API 제한은 별도로 고려해야 합니다.
 
-`GEMINI_MODEL` 기본값은 `gemini-2.5-flash`입니다. YouTube URL 수용 및 무료 제공 여부는 프로젝트·모델·시점마다 달라질 수 있습니다. `GEMINI_FALLBACK_MODEL`은 **YouTube URL 입력과 무료 할당량을 별도 검증한 모델**로만 설정하세요. 빈 값이면 기본 모델로 1회 재시도합니다. 어떠한 유료 자동 전환도 구현하지 않았습니다.
+공식 문서: [Gemini 가격](https://ai.google.dev/gemini-api/docs/pricing) · [YouTube 영상 이해](https://ai.google.dev/gemini-api/docs/video-understanding) · [과금 정책](https://ai.google.dev/gemini-api/docs/billing)
 
-### 외부 콘솔
+## 사용 방법
 
-- Vercel: 런타임 로그, 오류 및 함수 사용량
-- Google Cloud Console: YouTube Data API 할당량
-- AI 제공자 콘솔: 모델별 토큰·동영상 처리 할당량 및 과금 여부
-- Upstash Console: Redis 사용량, 작업 잠금/무료 횟수
+1. YouTube ID/URL 입력 → YouTube Data API로 길이·공개 상태 확인 → AI 분석 버튼 클릭.
+2. Gemini 무료 모델이 URL 영상을 직접 처리하여 네 가지 탭 데이터(JSON)를 생성. 영상, 음성, 자막을 무단 다운로드하지 않습니다.
+3. 화면에는 한국어 요약, 타임라인, 해설 아티클이 표시됩니다. 정확한 발화를 확보하지 못하면 스크립트 탭은 비어 있으며 허구의 전사를 생성하지 않습니다.
+4. 모든 항목은 편집 가능합니다. 편집 결과와 AI 원본은 브라우저 IndexedDB에만 저장됩니다. 기존 결과 무료 재열람, MD/TXT/PDF/DOCX 다운로드 지원.
 
-서버 로그에는 `analysis.completed`, `analysis.attempt_failed`, `ai.http_error`, `youtube.failure` 등의 이벤트와 요청 ID, 재시도 수, 처리 시간, 사용 토큰(제공된 경우)을 남깁니다. 분석 본문은 기록하지 않습니다. `estimatedCostUsd`는 토큰 수와 환경변수 `AI_INPUT_USD_PER_1M_TOKENS`, `AI_OUTPUT_USD_PER_1M_TOKENS`가 모두 설정된 경우에만 추정하며, 실제 청구액과 다릅니다.
+지원하지 않는 공개 YouTube URL이 있을 수 있습니다. API 호출에 성공해도 실제 의미 기반 시간 근거가 맞는지는 수동 검증해야 합니다. 자막 없는 영상의 모든 발화가 정확히 추출된다고 보장하지 않습니다.
 
-## API
+## 기술적 제약 및 향후 과제
 
-- `GET /api/video?id=VIDEO_ID`: 길이·공개 여부 검증, 메타데이터 반환
-- `GET /api/quota`: 익명 식별자 쿠키 발급, 남은 횟수 조회
-- `POST /api/analyze`: `{videoId,requestId: UUID}`; 서버에서 같은 출처/사용량/영상 검증, AI 실행, 성공 시 횟수 확정/실패 시 반환
+- 동기 PoC: 첫 요청 최대 175초, 일시적 서버 오류에 한해 재시도 1회 최대 85초. 30분 영상 분석을 10분 안에 완료한다고 보장하지 않습니다.
+- AI 작업이 실행되는 동안 브라우저를 닫으면 결과가 유실될 수 있습니다. 로컬 메모리 동시 실행 차단은 단일 개발 서버 프로세스에서만 유효합니다.
+- Vercel 등 프로덕션 배포에서는 유료 키 오남용을 막기 위해 `/api/analyze`와 `/api/video`를 기본 차단합니다. 공개 SaaS를 만들 때는 인증, 요청 제한, 비용 제한, 큐/워커를 다시 설계해야 합니다.
+- 영상 메타데이터에는 YouTube Data API v3 키가 필요하며 영상은 공개 상태, 길이 1~1800초여야 합니다.
+- DOCX 내보내기는 간단한 문단 구조이고 PDF는 이미지 기반으로 텍스트 검색·선택이 제한됩니다.
+- README/PRD는 기술 실험용이며, 외부 공개 전 약관/저작권/개인정보 정책을 재검토해야 합니다.
 
-**서비스 중단:** `ANALYSIS_PAUSED=true` 설정. 서버에 영구 결과 저장은 없으며, 완료된 콘텐츠는 브라우저에만 저장됩니다.
+## npm 보안 점검
 
-### 실행 제한 및 동기 분석 PoC
-
-Vercel Hobby 300초 함수 제한을 고려하여 개별 요청을 약 5분 미만으로 설정한 **동기 PoC**입니다 (첫 시도 175초, 재시도 85초 + 기타 처리). PRD의 30분 입력/10분 완료는 목표이지 현재 보장 성능이 아닙니다. 실제 10분 장시간 작업 지원에는 별도 비동기 워커, 작업 큐, 안전한 결과 전달 구조가 필요합니다. 이 구현은 브라우저를 닫으면 진행 중인 작업의 결과가 유실될 수 있습니다. Redis 작업 잠금은 TTL 700초이며 함수 강제 종료로 예약이 남으면 만료 후 새 요청이 가능하지만, 정산 로그 점검이 필요합니다.
-
-무료 사용량 계산은 서버가 권위를 가집니다. 브라우저 저장 성공 여부는 서버가 신뢰할 수 없으므로, **검증된 AI 생성 성공 시** 횟수를 확정합니다. 로컬 저장 실패 시 결과 다운로드를 안내하며 무료 횟수는 자동 반환하지 않습니다. 이는 클라이언트가 저장 실패를 위조해 무제한 분석하는 남용을 막기 위한 초기 정책입니다.
-
-전체 일일 AI 동영상 시간 상한은 **자동 재시도까지 고려해 요청당 영상 길이의 2배**를 보수적으로 예약합니다. 무료 API 제공자의 자체 할당량과 일치하지 않으므로 공급자 콘솔에서 실제 사용량 확인이 필수입니다.
-
-## 문서 내보내기
-
-- `.md`, `.txt`: UTF-8 다운로드
-- `.docx`: OpenXML 규격 ZIP (단순 문단 서식), Word에서 편집 가능
-- `.pdf`: 브라우저 Canvas에 한국어 글자를 그려 페이지별 JPEG로 넣는 이미지 기반 PDF (텍스트 선택/검색은 불가). 브라우저 렌더링 글꼴 사용, 별도 글꼴 파일 배포 없음.
-
-모든 형식은 **현재 사용자 편집본 전체**를 다운로드합니다. 원본 영상 구간을 누르면 플레이어가 해당 위치로 이동하며, 편집한 문장의 근거는 반드시 재검증해야 합니다.
-
-## 출시 전 필수 해결 사항
-
-1. YouTube URL 영상 접근 및 자막 없는 영상의 적법한 실제 분석 입력 경로 검증. 현재 PoC는 Gemini 무료 사용 가능 조건에 의존합니다.
-2. 영상 유형별 근거 시간/품질 수동 평가. Zod 수준의 필드 검증만으로 사실성 검증이 보장되지 않습니다.
-3. 30분 영상의 10분 이내 처리 성능 확인, 필요시 워커/큐 구현.
-4. 익명 이용자의 IP/쿠키 우회 한계, Redis 잠금 TTL/실패 정산, 봇 검증 보강.
-5. 상업 서비스 출시 전 Vercel 적합 플랜, 개인정보처리방침, 약관, 영상/전사 저작권, 공급자 데이터 처리 및 YouTube API 정책 확인.
-6. 사용자 편집 원본, 브라우저 저장 공간 소진 및 PDF/DOCX 대용량 파일 교차 브라우저 QA.
-7. PDF 텍스트 검색 가능 방식은 향후 공식 한국어 임베딩 글꼴 기반 PDF 생성기로 개선.
-
-이 저장소는 계정·결제·공개 공유를 아직 포함하지 않습니다. 필요시 SaaS 2단계에서 추가합니다.
+이 패치는 package.json/lock 버전 변경을 포함하지 않습니다. 설치된 의존성은 Mac에서 `npm audit --omit=dev` 및 `npm audit`로 확인해주세요. `npm audit fix --force`는 호환성 검토 전에 실행하지 마세요.
