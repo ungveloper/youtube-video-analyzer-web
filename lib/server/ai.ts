@@ -173,6 +173,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   onProgress({type:'progress',step:3,attempt:sourceCalls+1,label:'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
   let content:AnalysisContent;
   let composed=false;
+  let composeFailureCode: string | undefined;
   let stage2tokens:null|{input:number|null;output:number|null}=null;
   try {
     // Pass 2 is text only. No second video ingestion and no ability to add source claims.
@@ -184,18 +185,21 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
     // The first step has original, bounded evidence: show that source only,
     // transparently labeled as a reduced result. Never fabricate the rest.
-    console.warn(JSON.stringify({event:'analysis.compose_fallback',requestId,model,code:error instanceof ServiceError?error.code:'INVALID_OR_TIMEOUT'}));
+    composeFailureCode=error instanceof ServiceError?error.code:'INVALID_OR_TIMEOUT';
+    console.warn(JSON.stringify({event:'analysis.compose_fallback',requestId,model,code:composeFailureCode,message:error instanceof Error?error.message.slice(0,160):'unknown'}));
     content=fallbackFromSource(source);
     onProgress({type:'progress',step:3,label:'근거 추출 결과 제공',detail:'상세 문서 생성에 실패하여 1차 근거 요지를 안전하게 표시합니다.'});
   }
   if(provided) content=includeMissingCaptionTimeline(source,content);
   const audit=assessSourceCoverage(source,content,video.durationSeconds,composed);
-  if(audit.qualityStatus==='partial') content.exclusions.push('근거 또는 설명 범위가 충분하지 않아 이 결과는 부분 분석입니다. 실제 영상과 대조해주세요.');
+  if(audit.sourceIncomplete) content.exclusions.push('1차 근거 자료가 영상 전체를 충분히 대표하지 못할 수 있습니다. 후반부의 증상·비교·결론 등을 직접 확인하세요.');
+  if(audit.articleIncomplete) content.exclusions.push(composed?'아티클이 상세도 기준에 미치지 못합니다. 근거만으로 충분한 설명을 생성하지 못했습니다.':'2차 아티클 생성 실패: 아티클은 제공하지 않고 1차 근거 메모만 보여줍니다.');
+  if(audit.qualityStatus==='partial') content.exclusions.push('부분 분석으로 분류했습니다. 실제 영상과 대조하여 누락된 내용을 확인하세요.');
   const result=recordFromContent(video,model,source.evidence,content);
-  result.analysisMeta={depth:'deep',providerCalls:sourceCalls+1,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length, sourceMode:provided?'user-captions':'video-url', qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent};
+  result.analysisMeta={depth:'deep',providerCalls:sourceCalls+1,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length, sourceMode:provided?'user-captions':'video-url', qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,articleChars:audit.articleChars,composeFailureCode};
   onProgress({type:'progress',step:4,label:'근거 연결 검사 완료',detail:'존재하는 근거 ID·시간 범위를 확인했습니다. 사실 일치는 원본 대조가 필요합니다.'});
   const quality=assessDetail(content,video.durationSeconds);
-  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+1,sourceCalls,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent}));
+  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+1,sourceCalls,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,sourceBuckets:audit.sourceBuckets,articleChars:audit.articleChars,sourceIncomplete:audit.sourceIncomplete,articleIncomplete:audit.articleIncomplete,composeFailureCode:composeFailureCode??null}));
   return result;
 }
 export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string):Promise<AnalysisRecord>{

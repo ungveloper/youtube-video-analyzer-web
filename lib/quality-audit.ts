@@ -1,23 +1,37 @@
 import type { AnalysisContent } from '@/lib/types';
 import type { SourceMap } from '@/lib/server/evidence-pipeline';
 
-/** A structural coverage indicator, NOT factual truth certification. */
-export function assessSourceCoverage(source:SourceMap,content:AnalysisContent,duration:number,composed:boolean) {
-  const all=new Set(source.evidence.map(e=>e.id));
-  const touched=new Set([...content.summary,...content.timeline,...content.article].flatMap(item=>item.evidenceIds).filter(id=>all.has(id)));
-  const coveragePercent=all.size?Math.round(touched.size/all.size*100):0;
-  const articleChars=content.article.reduce((n,x)=>n+x.text.trim().length,0);
-  const minimumClaims=Math.min(8,Math.max(3,Math.round(duration/60)));
-  const minimumChars=Math.min(1350,Math.max(350,Math.round(duration*2)));
-  const qualityStatus:'review'|'partial'= composed && source.claims.length>=minimumClaims && coveragePercent>=40 && articleChars>=minimumChars?'review':'partial';
-  return {qualityStatus,coveragePercent,articleChars,sourceClaims:source.claims.length};
-}
-/** Ensures all uncovered timed-caption segments remain readable, instead of vanishing in LLM summarization. */
-export function includeMissingCaptionTimeline(source:SourceMap,content:AnalysisContent):AnalysisContent {
-  const used=new Set(content.timeline.flatMap(x=>x.evidenceIds));
-  const extra=source.evidence.filter(e=>!used.has(e.id) && e.kind==='caption' && e.note?.trim()).map((e,i)=>({
-    id:`original-caption-${i}`,title:'원문 자막 · 추가 구간',text:e.note||'',evidenceIds:[e.id],
+/** Diagnostics reflect source distribution and writing completeness, never medical/factual correctness. */
+export function assessSourceCoverage(source: SourceMap, content: AnalysisContent, duration: number, composed: boolean) {
+  const sourceIds = new Set(source.evidence.map(e => e.id));
+  const references = new Set([...content.summary, ...content.timeline, ...content.article].flatMap(item => item.evidenceIds).filter(id => sourceIds.has(id)));
+  const coveragePercent = sourceIds.size ? Math.round(references.size / sourceIds.size * 100) : 0;
+  const articleChars = content.article.reduce((n, item) => n + item.text.trim().length, 0);
+  const lastTimestamp = Math.max(0, ...source.evidence.map(e => e.endSeconds));
+  const sourceEndPercent = duration > 0 ? Math.min(100, Math.round(lastTimestamp / duration * 100)) : 0;
+  const sourceBuckets = new Set(source.evidence.flatMap(e => {
+    const start = Math.max(0, Math.min(3, Math.floor(e.startSeconds / duration * 4)));
+    const end = Math.max(0, Math.min(3, Math.floor(Math.max(e.startSeconds, e.endSeconds - 0.01) / duration * 4)));
+    return Array.from({length: end - start + 1}, (_, i) => start + i);
   }));
-  const firstTime=(ids:string[])=>Math.min(...ids.map(id=>source.evidence.find(e=>e.id===id)?.startSeconds??Infinity));
-  return {...content,timeline:[...content.timeline,...extra].sort((a,b)=>firstTime(a.evidenceIds)-firstTime(b.evidenceIds))};
+  const articleText = content.article.map(item => item.text.trim()).join('\n');
+  const timelineText = content.timeline.map(item => item.text.trim()).join('\n');
+  // Avoid presenting a duplicated evidence list as a standalone explanatory article.
+  const duplicatedArticle = articleText.length > 0 && articleText === timelineText;
+  const minArticleChars = duration <= 300 ? 650 : duration <= 900 ? 1200 : 2200;
+  const minimumClaims = duration <= 300 ? 5 : duration <= 900 ? 8 : 12;
+  const sourceIncomplete = source.claims.length < minimumClaims || sourceBuckets.size < 3 || sourceEndPercent < 73;
+  const articleIncomplete = !composed || !content.summary.length || !content.timeline.length || articleChars < minArticleChars || duplicatedArticle;
+  const qualityStatus: 'review' | 'partial' = sourceIncomplete || articleIncomplete || coveragePercent < 55 ? 'partial' : 'review';
+  return { qualityStatus, coveragePercent, articleChars, sourceClaims: source.claims.length, sourceEndPercent, sourceBuckets: sourceBuckets.size, sourceIncomplete, articleIncomplete, duplicatedArticle };
+}
+
+/** Original caption segments remain accessible when the model omits one in a composed timeline. */
+export function includeMissingCaptionTimeline(source: SourceMap, content: AnalysisContent): AnalysisContent {
+  const used = new Set(content.timeline.flatMap(x => x.evidenceIds));
+  const extra = source.evidence.filter(e => !used.has(e.id) && e.kind === 'caption' && e.note?.trim()).map((e, i) => ({
+    id: `original-caption-${i}`, title: '원문 자막 · 추가 구간', text: e.note || '', evidenceIds: [e.id],
+  }));
+  const firstTime = (ids: string[]) => Math.min(...ids.map(id => source.evidence.find(e => e.id === id)?.startSeconds ?? Infinity));
+  return {...content, timeline: [...content.timeline, ...extra].sort((a,b) => firstTime(a.evidenceIds) - firstTime(b.evidenceIds))};
 }
