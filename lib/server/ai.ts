@@ -6,29 +6,23 @@ import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
 import { assessDetail, detailTargets } from '@/lib/analysis-detail';
 import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource } from '@/lib/server/evidence-pipeline';
-import { sourceFromUserCaptions, trustedCaptionClaims, captionClaimPrompt } from '@/lib/server/caption-source';
-import { assessSourceCoverage, includeMissingCaptionTimeline } from '@/lib/quality-audit';
+import { sourceFromUserCaptions } from '@/lib/server/caption-source';
+import { assessSourceCoverage, assessSinglePassCoverage, includeMissingCaptionTimeline } from '@/lib/quality-audit';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
-const prompt = `너는 교육·지식 콘텐츠 전문 한국어 영상 분석 편집자다. 입력한 YouTube 영상 자체를 분석하여 사용자가 영상 없이도 논지, 설명 과정, 구체적인 근거를 이해할 수 있는 고밀도 해설을 작성한다.
+const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
+우선순위: **시청자가 영상을 보지 않아도 모든 논점과 비교·사례·경고를 이해하도록 빠짐없이 기록**한다. 길게 쓰는 척하기 위해 영상에 없는 내용은 추가하지 않는다.
 
-절대 원칙:
-- 반드시 입력 영상에서 실제 확인할 수 있는 정보만 사용한다. 영상 제목·썸네일·설명만으로 내용을 상상하거나 일반 상식으로 문단을 채우지 않는다.
-- 수치·인물·증상·의학/법률/금융적 효과·인과관계는 영상 속 발화/장면으로 확인할 때만 명시한다. 발표자의 주장과 객관적으로 검증된 사실을 구별한다.
-- 설명되지 않은 외부 사실, 추측 사례, 근거 없는 도표, 통계, 임의 타임스탬프를 생성하지 않는다.
-- 동일 내용을 다른 표현으로 늘어놓지 않는다. 반복 발언은 한 번 정리하되 서로 다른 논점은 누락하지 않는다.
-- 모든 요약 항목/타임라인 항목/아티클 소제목에는 실제 영상 구간의 evidenceIds를 1개 이상 연결한다. 근거 시간은 0초~영상 길이 범위 내 실제 장면/발화에 가깝게 한다. 근거를 못 찾으면 해당 주장은 제외한다.
-
-진행 방식:
-1) 전체 영상을 시작부터 끝까지 따라가며 발화/화면에 등장한 주장, 예시, 정의, 경고, 결론과 주제 변화 지점을 찾는다.
-2) evidence 배열에 확인 가능한 구간을 기록한다. 한 구간을 여러 주장에 재사용해도 된다. 실제 장면 시각과 다르게 시간을 채우기 위해 구간을 쪼개지는 않는다.
-3) summary는 **서로 구분되는 핵심 주장**별 항목 목록으로 작성한다. text 각각 2~4문장으로 '무엇을 말했는지 / 영상에서 어떻게 설명했는지'를 담는다. 하나의 summary 항목에 전체 영상을 압축하지 않는다.
-4) timeline은 시간순으로 주제 전환, 새로운 주장, 예시 및 결론을 최대한 촘촘하게 나눈다. title은 고유한 주제, text는 그 순간의 실제 내용과 설명 흐름을 2~4문장으로 구체적으로 설명한다. 단순 '소개·설명·마무리' 등의 제목만 반복하지 않는다.
-5) article은 짧은 요약문이 아니라 영상에 기반한 **독립적으로 읽기 쉬운 상세 해설 아티클**이다. 도입→개념/문제→세부 논거·사례→주의점·결론의 실제 순서를 따르고, 소제목별 text에는 2~4개 문단(문단 사이 \n\n), 문단별 2~4문장 정도의 충분한 해설을 작성한다. 영상에 내용이 부족한 소제목은 짧게 유지한다. 영상에서 쓰는 용어를 설명하되 외부 사실을 섞지 않는다.
-6) transcript는 원본 발화를 정확히 확인할 수 있는 경우에만 작성한다. 외국어 발화는 원문을 확보한 경우 한국어 번역과 translated=true. 정확한 전사/발화 시점을 확인할 수 없으면 []로 비운다. 영상 대사를 추측하여 구성하거나 요약문을 스크립트라고 부르지 않는다.
-7) exclusions에는 확인할 수 없는 주요 정보/제약만 구체적으로 적는다. 특별히 없으면 []로 둔다. 상투적인 면책 문구로 길이를 채우지 않는다.
-
-모든 출력은 한국어로, JSON 객체 한 개만 출력한다. summary/timeline/article는 각각 서로 구별되는 내용을 충분한 항목으로 작성한다. 제공된 JSON Schema 구조를 따른다.`;
+작업 규칙:
+1. **반드시 영상 마지막까지 검토**한다. 초반 개념에 토큰을 소진하지 말고 0~25%, 25~50%, 50~75%, 75~100% 구간의 발언에서 새로운 정보가 등장하는지 차례대로 검토한다. 후반의 새로운 증상·비교·구별법·결론을 놓치지 않는다.
+2. 우선 타임라인을 만든다. 한 영상 구간에서 별개의 주장·사례·상황이 나오면 별개의 타임라인 항목으로 기록한다. 3~5분 정보 중심 영상이라면 실제 논점이 있을 때 약 7~14개의 타임라인을 목표로 한다. 각 항목은 구체적 실제 발언 1~3문장으로 기술한다. 도입/정의/기전/사례 같은 추상적 제목만 반복하지 않는다.
+3. summary는 타임라인의 세부 논점을 논리별로 묶은 **서로 다른 요점 3~6개**로 구성한다. 각 요점은 고유한 주장 + 영상의 이유 또는 구체적인 사례를 2~3문장으로 쓴다.
+4. article은 한 줄씩 복사한 항목집이 아니라 영상 원문을 토대로 이어지는 **설명형 완성 아티클**이다. 실제 확인한 (a) 정의·비유 (b) 원인 및 다른 가능성 (c) 사례 (d) 증상과 혼동하기 쉬운 내용의 차이 (e) 화자의 결론 중 영상에 나온 소재만 사용해 3~6개의 의미 있는 소제목으로 나눈다. 항목별 본문은 실제 정보가 있으면 여러 개의 자연스러운 문단으로 쓰고 같은 문장을 반복하지 않는다.
+5. 모든 summary·timeline·article 항목에 evidenceIds를 연결한다. 존재하는 영상의 실제 발언 시간만 적고 없거나 불확실한 시간·수치·주장을 만들지 않는다. 발표자의 의학적·통계적 주장과 별도로 검증된 과학적 사실을 구분한다.
+6. transcript는 발언을 정확하게 전사했다고 확신할 때만 제공한다. 원문 확인이 불가능하면 []이고 생성한 해설을 발화문으로 둔갑시키지 않는다.
+7. 영상 **마지막 25%까지 근거가 도달하지 않았다면**, exclusions에 후반부 발언 확인이 어려웠다고 기록한다. 후반부 내용을 억지로 채우지 말라.
+8. 출력은 제공된 JSON Schema를 지키는 한국어 JSON 한 개. 문서가 너무 짧아질 것 같으면 근거가 있는 타임라인 논점과 증상/차이점/결론의 누락을 우선 방지한다.
+`;
 export type InteractionResponse = {
   steps?: Array<{type?:string; content?:Array<{type?:string;text?:string}>}>;
   output_text?: string;
@@ -123,54 +117,38 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   let stage1: Awaited<ReturnType<typeof interaction>> | null = null;
   let sourceCalls = 0;
   const provided = captionText?.trim() ? sourceFromUserCaptions(captionText,video) : null;
-  for (let retry = 0; retry < 2; retry++) {
-    if (signal?.aborted) throw new ServiceError('CANCELLED', '분석이 중단되었습니다.', 499);
-    sourceCalls++;
-    onProgress({
-      type:'progress',step:2,attempt:sourceCalls,
-      label:retry===0?'1/2 · 영상 근거 추출':'1/2 · 영상 근거 추출 재시도',
-      detail:retry===0
-        ? '원본 영상에서 근거를 추출합니다. 모델 내부 처리율은 확인할 수 없습니다.'
-        : 'Google의 일시적 오류로 잠시 기다린 뒤 한 번만 재시도합니다. 정상 2회 대신 최대 3회 호출될 수 있습니다.',
-    });
-    try {
-      stage1=await interaction({
-        key,model,requestId,pass:provided?'caption-claims':'source-map',format:sourceResponseFormat,
-        input:provided?[{type:'text',text:captionClaimPrompt(provided)}]:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],
-        signal,timeoutMs:125000,
-        // Video extraction is simpler than final composition; lower thinking
-        // reduces reasoning overhead without changing the selected model.
-        thinkingLevel:'low',
-      });
-      break;
-    } catch (error) {
-      if (signal?.aborted) throw new ServiceError('CANCELLED', '분석이 중단되었습니다.', 499);
-      const converted=isTimeout(error)
-        ? new ServiceError('TIMEOUT','영상 근거 추출 시간이 초과됐습니다.',504)
-        : error;
-      const retryable=(converted instanceof ServiceError && ['TEMPORARY_HTTP','TIMEOUT'].includes(converted.code))
-        || (converted instanceof Error && !(converted instanceof ServiceError) && /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i.test(converted.message));
-      if (retry===0 && retryable) {
-        console.warn(JSON.stringify({event:'analysis.source_retry_scheduled',requestId,model,afterAttempt:sourceCalls,code:converted instanceof ServiceError?converted.code:'NETWORK_ERROR'}));
-        await new Promise<void>(resolve=>setTimeout(resolve,1400));
-        continue;
+  let source: ReturnType<typeof parseSourceMap>;
+  if(provided){
+    // Trusted timed transcript is already an evidence ledger. Do not pay for
+    // a redundant preliminary text-model extraction; compose in ONE API call.
+    source=provided;
+    onProgress({type:'progress',step:2,label:'시간 지정 원문 확인',detail:`사용자가 제공한 ${provided.evidence.length}개 원문 구간을 확보했습니다. 영상 재요청 없이 문서를 작성합니다.`});
+  }else{
+    for(let retry=0;retry<2;retry++){
+      if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+      sourceCalls++;
+      onProgress({type:'progress',step:2,attempt:sourceCalls,label:retry===0?'1/2 · 영상 근거 추출':'1/2 · 영상 근거 추출 재시도',detail:retry===0?'영상 처음부터 끝까지 발언·사례·차이점·결론 근거를 추출합니다.':'일시적인 Google 오류로 잠시 기다린 뒤 한 번만 재시도합니다.'});
+      try{
+        stage1=await interaction({key,model,requestId,pass:'source-map',format:sourceResponseFormat,input:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],signal,timeoutMs:125000,thinkingLevel:'low'});
+        break;
+      }catch(error){
+        if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+        const converted=isTimeout(error)?new ServiceError('TIMEOUT','영상 근거 추출 시간이 초과됐습니다.',504):error;
+        const retryable=converted instanceof ServiceError && ['TEMPORARY_HTTP','TIMEOUT'].includes(converted.code);
+        if(retry===0 && retryable){
+          console.warn(JSON.stringify({event:'analysis.source_retry_scheduled',requestId,model,code:converted.code}));
+          await new Promise<void>(resolve=>setTimeout(resolve,1400));
+          continue;
+        }
+        if(converted instanceof ServiceError && converted.code==='TEMPORARY_HTTP')throw new ServiceError('PROVIDER_TEMPORARY',`선택한 ${model} 모델의 영상 입력 처리에서 Google 서버 오류가 ${sourceCalls}회 발생했습니다. 다른 무료 모델을 수동으로 선택할 수 있습니다. 자동 유료 전환은 하지 않습니다. 마지막 오류: ${converted.message}`,502);
+        throw converted;
       }
-      if (converted instanceof ServiceError && converted.code==='TEMPORARY_HTTP') {
-        throw new ServiceError('PROVIDER_TEMPORARY',
-          `선택한 ${model} 모델의 영상 입력 처리에서 Google 서버 오류가 ${sourceCalls}회 발생했습니다. 잠시 후 다시 시도하거나, 화면에서 Gemini 3.5 Flash-Lite를 직접 선택해 비교해주세요. 자동 유료 모델 전환은 하지 않습니다. 마지막 오류: ${converted.message}`,502);
-      }
-      if (provided && retry===1 && retryable) {
-        console.warn(JSON.stringify({event:'analysis.caption_claims_fallback',requestId,model,reason:'MODEL_TRANSIENT'}));
-        break; // The deterministic timed-caption evidence still exists.
-      }
-      throw converted;
     }
+    if(!stage1)throw new ServiceError('PROVIDER_UNAVAILABLE','영상에서 근거를 확보하지 못했습니다.',502);
+    try{source=parseSourceMap(stage1.parsed,video);}
+    catch(error){throw new ServiceError('INVALID_SOURCE_MAP',error instanceof Error?error.message:'영상 근거 추출에 실패했습니다.',502);}
   }
-  if (!stage1 && !provided) throw new ServiceError('PROVIDER_UNAVAILABLE','근거 추출 결과가 없습니다.',502);
-  let source;
-  try { source=provided?(stage1?trustedCaptionClaims(stage1.parsed,provided):provided):parseSourceMap(stage1!.parsed,video); }
-  catch(error){throw new ServiceError('INVALID_SOURCE_MAP',error instanceof Error?error.message:'원본 근거를 추출하지 못했습니다.',502);}
-  onProgress({type:'progress',step:3,attempt:sourceCalls+1,label:'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
+  onProgress({type:'progress',step:3,attempt:sourceCalls+1,label:provided?'시간 지정 원문 · 상세 문서 작성 (1회)':'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
   let content:AnalysisContent;
   let composed=false;
   let composeRecovery: 'article-only' | undefined;
@@ -191,7 +169,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     // A narrow article-only retry is easier for a provider to satisfy than a
     // three-document structured response. It uses text evidence, never a new video call.
     // Do not retry a quota, permissions, or cancellation error.
-    const retryable=['TEMPORARY_HTTP','TIMEOUT','INVALID_RESULT'].includes(composeFailureCode);
+    const retryable=!provided && ['TEMPORARY_HTTP','TIMEOUT','INVALID_RESULT'].includes(composeFailureCode);
     if(retryable){
       onProgress({type:'progress',step:3,attempt:sourceCalls+2,label:'아티클 전용 복구 시도',detail:'전체 문서 요청이 실패해 더 작은 아티클 전용 요청을 한 번만 시도합니다. 무료 요청을 추가 사용합니다.'});
       try {
@@ -215,7 +193,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   // Try one bounded article-only composition without discarding already good
   // summary/timeline sections; never call the video URL a second time.
   const minUsefulArticleChars=video.durationSeconds<=300?650:video.durationSeconds<=900?1100:1800;
-  if(composed && !composeRecovery && content.article.reduce((n,x)=>n+x.text.trim().length,0)<minUsefulArticleChars){
+  if(composed && !provided && !composeRecovery && content.article.reduce((n,x)=>n+x.text.trim().length,0)<minUsefulArticleChars){
     onProgress({type:'progress',step:3,attempt:sourceCalls+compositionCalls+1,label:'아티클 상세도 보강',detail:'아티클 분량이 부족해 근거만 사용하는 전용 작성 요청을 한 번 더 시도합니다. 무료 API 사용량이 추가됩니다.'});
     try {
       compositionCalls++;
@@ -258,8 +236,11 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
     try {
       const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'text',text:prompt+'\n'+detailInstructions},{type:'video',uri:video.url}],signal,timeoutMs:attempts[i]});
       const result=convert(response.parsed,video,model);
-      result.analysisMeta={depth:'standard',providerCalls:i+1,refinement:'not-needed',pipeline:'single-pass'};
-      onProgress({type:'progress',step:4,label:'결과 구조 검증 완료',detail:'영상 근거 구조와 시간 범위를 확인했습니다.'});
+      const audit=assessSinglePassCoverage(result.evidence,result.original,video.durationSeconds);
+      result.analysisMeta={depth:'standard',providerCalls:i+1,refinement:'not-needed',pipeline:'single-pass',qualityStatus:audit.incomplete?'partial':'review',sourceEndPercent:audit.lastTimelinePercent};
+      if(audit.incomplete)result.original.exclusions.push(`영상 후반부 및 타임라인의 시간 분포가 불충분합니다(마지막 타임라인 근거 시작: 약 ${audit.lastTimelinePercent}%). 표시된 내용은 부분 분석이며 누락 내용을 임의로 보완하지 않았습니다.`);
+      result.edited=structuredClone(result.original);
+      onProgress({type:'progress',step:4,label:'타임라인 전체 구간 검사',detail:audit.incomplete?'후반부의 근거가 부족해 부분 분석으로 표시합니다.':'타임라인 시간 분포와 근거 구조를 확인했습니다.'});
       const quality=assessDetail(result.original,video.durationSeconds);
       console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'standard',providerCalls:i+1,tokens:response.tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
       return result;

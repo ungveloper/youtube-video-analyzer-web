@@ -7,20 +7,16 @@ export function assessSourceCoverage(source: SourceMap, content: AnalysisContent
   const references = new Set([...content.summary, ...content.timeline, ...content.article].flatMap(item => item.evidenceIds).filter(id => sourceIds.has(id)));
   const coveragePercent = sourceIds.size ? Math.round(references.size / sourceIds.size * 100) : 0;
   const articleChars = content.article.reduce((n, item) => n + item.text.trim().length, 0);
-  const lastTimestamp = Math.max(0, ...source.evidence.map(e => e.endSeconds));
+  const lastTimestamp = Math.max(0, ...source.evidence.map(e => e.startSeconds));
   const sourceEndPercent = duration > 0 ? Math.min(100, Math.round(lastTimestamp / duration * 100)) : 0;
-  const sourceBuckets = new Set(source.evidence.flatMap(e => {
-    const start = Math.max(0, Math.min(3, Math.floor(e.startSeconds / duration * 4)));
-    const end = Math.max(0, Math.min(3, Math.floor(Math.max(e.startSeconds, e.endSeconds - 0.01) / duration * 4)));
-    return Array.from({length: end - start + 1}, (_, i) => start + i);
-  }));
+  const sourceBuckets = new Set(source.evidence.map(e => Math.max(0, Math.min(3, Math.floor(e.startSeconds / duration * 4)))));
   const articleText = content.article.map(item => item.text.trim()).join('\n');
   const timelineText = content.timeline.map(item => item.text.trim()).join('\n');
   // Avoid presenting a duplicated evidence list as a standalone explanatory article.
   const duplicatedArticle = articleText.length > 0 && articleText === timelineText;
   const minArticleChars = duration <= 300 ? 650 : duration <= 900 ? 1200 : 2200;
   const minimumClaims = duration <= 300 ? 5 : duration <= 900 ? 8 : 12;
-  const sourceIncomplete = source.claims.length < minimumClaims || sourceBuckets.size < 3 || sourceEndPercent < 73;
+  const sourceIncomplete = source.claims.length < minimumClaims || sourceBuckets.size < 4 || sourceEndPercent < 76;
   const articleIncomplete = !composed || !content.summary.length || !content.timeline.length || articleChars < minArticleChars || duplicatedArticle;
   const qualityStatus: 'review' | 'partial' = sourceIncomplete || articleIncomplete || coveragePercent < 55 ? 'partial' : 'review';
   return { qualityStatus, coveragePercent, articleChars, sourceClaims: source.claims.length, sourceEndPercent, sourceBuckets: sourceBuckets.size, sourceIncomplete, articleIncomplete, duplicatedArticle };
@@ -34,4 +30,17 @@ export function includeMissingCaptionTimeline(source: SourceMap, content: Analys
   }));
   const firstTime = (ids: string[]) => Math.min(...ids.map(id => source.evidence.find(e => e.id === id)?.startSeconds ?? Infinity));
   return {...content, timeline: [...content.timeline, ...extra].sort((a,b) => firstTime(a.evidenceIds) - firstTime(b.evidenceIds))};
+}
+
+/** One-call URL analysis still needs chronology checks; a completed API response
+ * isn't evidence of complete video coverage. This is only a structural audit. */
+export function assessSinglePassCoverage(evidence:SourceMap['evidence'], content:AnalysisContent, duration:number){
+  const used=new Set(content.timeline.flatMap(x=>x.evidenceIds));
+  const referenced=evidence.filter(e=>used.has(e.id));
+  const buckets=new Set(referenced.map(e=>Math.min(3,Math.floor(e.startSeconds / duration * 4))));
+  const latestStart=Math.max(0,...referenced.map(e=>e.startSeconds));
+  const lastTimelinePercent=duration?Math.round(latestStart/duration*100):0;
+  const expectedTimeline=duration<=300?6:duration<=900?9:12;
+  const incomplete=content.timeline.length<expectedTimeline || buckets.size<4 || lastTimelinePercent<76;
+  return {incomplete,lastTimelinePercent,buckets:buckets.size,timelineCount:content.timeline.length};
 }
