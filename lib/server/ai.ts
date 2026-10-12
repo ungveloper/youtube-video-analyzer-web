@@ -5,7 +5,7 @@ import { FREE_MODEL, type FreeModelId } from '@/lib/free-models';
 import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
 import { assessDetail, detailTargets } from '@/lib/analysis-detail';
-import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat } from '@/lib/server/evidence-pipeline';
+import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource } from '@/lib/server/evidence-pipeline';
 import { sourceFromUserCaptions, trustedCaptionClaims, captionClaimPrompt } from '@/lib/server/caption-source';
 import { assessSourceCoverage, includeMissingCaptionTimeline } from '@/lib/quality-audit';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
@@ -85,14 +85,14 @@ const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
 }
-async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium'}) {
+async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium';maxOutputTokens?:number}) {
   const timeout=AbortSignal.timeout(args.timeoutMs);
   const signal=args.signal?AbortSignal.any([args.signal,timeout]):timeout;
   const started=Date.now();
   const response=await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
     method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':args.key},
     cache:'no-store',signal,
-    body:JSON.stringify({model:args.model,store:false,input:args.input,generation_config:{max_output_tokens:16000,thinking_level:args.thinkingLevel??(args.model==='gemini-3.8-flash'?'medium':'low')},response_format:args.format}),
+    body:JSON.stringify({model:args.model,store:false,input:args.input,generation_config:{max_output_tokens:args.maxOutputTokens??16000,thinking_level:args.thinkingLevel??(args.model==='gemini-3.8-flash'?'medium':'low')},response_format:args.format}),
   });
   if(!response.ok){
     const detail=googleErrorDetail(await response.text().catch(() => ''));
@@ -173,33 +173,76 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   onProgress({type:'progress',step:3,attempt:sourceCalls+1,label:'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
   let content:AnalysisContent;
   let composed=false;
+  let composeRecovery: 'article-only' | undefined;
   let composeFailureCode: string | undefined;
   let stage2tokens:null|{input:number|null;output:number|null}=null;
+  let compositionCalls=0;
   try {
-    // Pass 2 is text only. No second video ingestion and no ability to add source claims.
+    compositionCalls++;
     const stage2=await interaction({key,model,requestId,pass:'compose',format:composedResponseFormat,input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],signal,timeoutMs:125000});
     content=extractComposedContent(stage2.parsed,source);
     composed=true;
     stage2tokens=stage2.tokens;
   } catch(error) {
     if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
-    // The first step has original, bounded evidence: show that source only,
-    // transparently labeled as a reduced result. Never fabricate the rest.
     composeFailureCode=error instanceof ServiceError?error.code:'INVALID_OR_TIMEOUT';
-    console.warn(JSON.stringify({event:'analysis.compose_fallback',requestId,model,code:composeFailureCode,message:error instanceof Error?error.message.slice(0,160):'unknown'}));
+    console.warn(JSON.stringify({event:'analysis.compose_failed',requestId,model,code:composeFailureCode,message:error instanceof Error?error.message.slice(0,160):'unknown'}));
     content=fallbackFromSource(source);
-    onProgress({type:'progress',step:3,label:'근거 추출 결과 제공',detail:'상세 문서 생성에 실패하여 1차 근거 요지를 안전하게 표시합니다.'});
+    // A narrow article-only retry is easier for a provider to satisfy than a
+    // three-document structured response. It uses text evidence, never a new video call.
+    // Do not retry a quota, permissions, or cancellation error.
+    const retryable=['TEMPORARY_HTTP','TIMEOUT','INVALID_RESULT'].includes(composeFailureCode);
+    if(retryable){
+      onProgress({type:'progress',step:3,attempt:sourceCalls+2,label:'아티클 전용 복구 시도',detail:'전체 문서 요청이 실패해 더 작은 아티클 전용 요청을 한 번만 시도합니다. 무료 요청을 추가 사용합니다.'});
+      try {
+        compositionCalls++;
+        await new Promise<void>((resolve,reject)=>{const timer=setTimeout(resolve,1000);signal?.addEventListener('abort',()=>{clearTimeout(timer);reject(new ServiceError('CANCELLED','중단됨',499));},{once:true});});
+        const recovery=await interaction({key,model,requestId,pass:'article-recovery',format:articleOnlyResponseFormat,
+          input:[{type:'text',text:articleOnlyRecoveryPrompt(source,video.durationSeconds)}],signal,timeoutMs:90000,thinkingLevel:'low',maxOutputTokens:9000});
+        content=recoverArticleFromSource(recovery.parsed,source);
+        composed=true;
+        composeRecovery='article-only';
+        stage2tokens=recovery.tokens;
+        console.info(JSON.stringify({event:'analysis.article_recovered',requestId,model,articleSections:content.article.length}));
+      }catch(recoveryError){
+        if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+        console.warn(JSON.stringify({event:'analysis.article_recovery_failed',requestId,model,code:recoveryError instanceof ServiceError?recoveryError.code:'INVALID_OR_TIMEOUT'}));
+      }
+    }
+    if(!composed)onProgress({type:'progress',step:3,label:'상세 문서 생성 실패',detail:'제공자가 작성 요청을 처리하지 못해 근거 메모만 제공합니다. 재호출하지 않습니다.'});
+  }
+  // A successful response may still omit an article or provide only a stub.
+  // Try one bounded article-only composition without discarding already good
+  // summary/timeline sections; never call the video URL a second time.
+  const minUsefulArticleChars=video.durationSeconds<=300?650:video.durationSeconds<=900?1100:1800;
+  if(composed && !composeRecovery && content.article.reduce((n,x)=>n+x.text.trim().length,0)<minUsefulArticleChars){
+    onProgress({type:'progress',step:3,attempt:sourceCalls+compositionCalls+1,label:'아티클 상세도 보강',detail:'아티클 분량이 부족해 근거만 사용하는 전용 작성 요청을 한 번 더 시도합니다. 무료 API 사용량이 추가됩니다.'});
+    try {
+      compositionCalls++;
+      const recovery=await interaction({key,model,requestId,pass:'article-detail',format:articleOnlyResponseFormat,
+        input:[{type:'text',text:articleOnlyRecoveryPrompt(source,video.durationSeconds)}],signal,timeoutMs:90000,thinkingLevel:'low',maxOutputTokens:9000});
+      const alternative=recoverArticleFromSource(recovery.parsed,source).article;
+      const existingChars=content.article.reduce((n,x)=>n+x.text.trim().length,0);
+      const alternativeChars=alternative.reduce((n,x)=>n+x.text.trim().length,0);
+      if(alternativeChars>existingChars){content={...content,article:alternative};composeRecovery='article-only';}
+      console.info(JSON.stringify({event:'analysis.article_detail_review',requestId,existingChars,alternativeChars,improved:alternativeChars>existingChars}));
+    }catch(detailError){
+      if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+      console.warn(JSON.stringify({event:'analysis.article_detail_unavailable',requestId,code:detailError instanceof ServiceError?detailError.code:'INVALID_OR_TIMEOUT'}));
+    }
   }
   if(provided) content=includeMissingCaptionTimeline(source,content);
   const audit=assessSourceCoverage(source,content,video.durationSeconds,composed);
+  if(composeRecovery)audit.qualityStatus='partial';
   if(audit.sourceIncomplete) content.exclusions.push('1차 근거 자료가 영상 전체를 충분히 대표하지 못할 수 있습니다. 후반부의 증상·비교·결론 등을 직접 확인하세요.');
+  if(composeRecovery)content.exclusions.push('복구된 아티클은 원본 근거를 사용했으나 요약·타임라인은 1차 근거 메모입니다. 전체 상세 분석으로 확정하지 않았습니다.');
   if(audit.articleIncomplete) content.exclusions.push(composed?'아티클이 상세도 기준에 미치지 못합니다. 근거만으로 충분한 설명을 생성하지 못했습니다.':'2차 아티클 생성 실패: 아티클은 제공하지 않고 1차 근거 메모만 보여줍니다.');
   if(audit.qualityStatus==='partial') content.exclusions.push('부분 분석으로 분류했습니다. 실제 영상과 대조하여 누락된 내용을 확인하세요.');
   const result=recordFromContent(video,model,source.evidence,content);
-  result.analysisMeta={depth:'deep',providerCalls:sourceCalls+1,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length, sourceMode:provided?'user-captions':'video-url', qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,articleChars:audit.articleChars,composeFailureCode};
+  result.analysisMeta={depth:'deep',providerCalls:sourceCalls+compositionCalls,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length, sourceMode:provided?'user-captions':'video-url', qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,articleChars:audit.articleChars,composeFailureCode,composeRecovery};
   onProgress({type:'progress',step:4,label:'근거 연결 검사 완료',detail:'존재하는 근거 ID·시간 범위를 확인했습니다. 사실 일치는 원본 대조가 필요합니다.'});
   const quality=assessDetail(content,video.durationSeconds);
-  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+1,sourceCalls,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,sourceBuckets:audit.sourceBuckets,articleChars:audit.articleChars,sourceIncomplete:audit.sourceIncomplete,articleIncomplete:audit.articleIncomplete,composeFailureCode:composeFailureCode??null}));
+  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+compositionCalls,sourceCalls,compositionCalls,composeRecovery:composeRecovery??null,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,sourceBuckets:audit.sourceBuckets,articleChars:audit.articleChars,sourceIncomplete:audit.sourceIncomplete,articleIncomplete:audit.articleIncomplete,composeFailureCode:composeFailureCode??null}));
   return result;
 }
 export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string):Promise<AnalysisRecord>{

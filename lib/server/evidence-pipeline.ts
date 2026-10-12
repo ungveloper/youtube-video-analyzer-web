@@ -114,3 +114,21 @@ JSON 객체 한 개만 출력한다.`;
 
 export const sourceResponseFormat={type:'text',mime_type:'application/json',schema:{type:'object',properties:{evidence:{type:'array',items:{type:'object',properties:{id:{type:'string'},startSeconds:{type:'number'},endSeconds:{type:'number'},kind:{type:'string'},note:{type:'string'}},required:['id','startSeconds','endSeconds','kind']}},claims:{type:'array',items:{type:'object',properties:{id:{type:'string'},text:{type:'string'},category:{type:'string'},evidenceIds:{type:'array',items:{type:'string'}}},required:['id','text','category','evidenceIds']}},transcript:{type:'array',items:{type:'object',properties:{startSeconds:{type:'number'},endSeconds:{type:'number'},text:{type:'string'},translated:{type:'boolean'}},required:['startSeconds','endSeconds','text','translated']}},exclusions:{type:'array',items:{type:'string'}}},required:['evidence','claims','transcript','exclusions']}};
 export const composedResponseFormat={type:'text',mime_type:'application/json',schema:{type:'object',properties:{summary:{type:'array',items:{type:'object',properties:{title:{type:'string'},text:{type:'string'},claimIds:{type:'array',items:{type:'string'}},evidenceIds:{type:'array',items:{type:'string'}}},required:['text','claimIds']}},timeline:{type:'array',items:{type:'object',properties:{title:{type:'string'},text:{type:'string'},claimIds:{type:'array',items:{type:'string'}},evidenceIds:{type:'array',items:{type:'string'}}},required:['title','text','claimIds']}},article:{type:'array',items:{type:'object',properties:{title:{type:'string'},text:{type:'string'},claimIds:{type:'array',items:{type:'string'}},evidenceIds:{type:'array',items:{type:'string'}}},required:['title','text','claimIds']}},exclusions:{type:'array',items:{type:'string'}}},required:['summary','timeline','article','exclusions']}};
+
+/** A narrow recovery prompt for transient full-compose failures. Never use for quota/permission errors. */
+export function articleOnlyRecoveryPrompt(source: SourceMap, duration:number): string {
+  const facts=source.claims.map(claim=>({id:claim.id,text:claim.text,evidenceIds:claim.evidenceIds}));
+  return `전체 문서 생성 서버 오류로 아티클만 재작성한다. 아래 근거 메모의 발언만 사용한다. 다른 정보는 추가하지 않는다.
+동영상 길이 ${duration}초. 근거 메모: ${JSON.stringify(facts).slice(0,48000)}
+논점을 한 줄씩 반복하는 목록을 금지한다. 시간순으로 논점을 묶어 서로 구분되는 2~6개 소제목을 만들고, 소제목마다 실제 서로 다른 claim 발언을 자연스러운 해설 문단으로 구성하라.
+가능하면 영상 중반·후반의 증상, 비교, 차이점, 결론을 빠뜨리지 않되 근거 메모에 없는 내용은 추정하지 마라. 외부 의학 지식으로 보완하지 마라.
+article 각 항목에는 정확한 claimIds만 붙인다. 특정 발언이 없다면 줄이되, 동일 내용 반복으로 분량을 채우지 마라. JSON 객체 하나만 출력한다.`;
+}
+export const articleOnlyResponseFormat={type:'text',mime_type:'application/json',schema:{type:'object',properties:{article:{type:'array',items:{type:'object',properties:{title:{type:'string'},text:{type:'string'},claimIds:{type:'array',items:{type:'string'}}},required:['title','text','claimIds']}}},required:['article']}};
+/** Merge only the article from a validated recovery response with source-grounded notes. */
+export function recoverArticleFromSource(raw:unknown, source:SourceMap):AnalysisContent {
+  const article=extractComposedContent(raw,source).article;
+  if (!article.length) throw new Error('복구된 아티클의 근거 ID가 올바르지 않습니다.');
+  const baseline=fallbackFromSource(source);
+  return {...baseline,article,exclusions:source.exclusions.slice()};
+}
