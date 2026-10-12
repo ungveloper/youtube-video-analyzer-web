@@ -3,9 +3,9 @@ import type { AnalysisContent } from '@/lib/types';
 // Editorial targets, not hard requirements: never manufacture claims to hit a count.
 export type DetailTargets = { summary: number; timeline: number; article: number };
 export function detailTargets(durationSeconds: number): DetailTargets {
-  if (durationSeconds <= 300) return { summary: 4, timeline: 6, article: 4 };
-  if (durationSeconds <= 900) return { summary: 5, timeline: 9, article: 6 };
-  return { summary: 6, timeline: 12, article: 8 };
+  if (durationSeconds <= 300) return { summary: 4, timeline: 9, article: 4 };
+  if (durationSeconds <= 900) return { summary: 5, timeline: 12, article: 6 };
+  return { summary: 6, timeline: 16, article: 8 };
 }
 export function assessDetail(content: AnalysisContent, durationSeconds: number) {
   const targets = detailTargets(durationSeconds);

@@ -8,6 +8,7 @@ import { assessDetail, detailTargets } from '@/lib/analysis-detail';
 import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource } from '@/lib/server/evidence-pipeline';
 import { sourceFromUserCaptions } from '@/lib/server/caption-source';
 import { assessSourceCoverage, assessSinglePassCoverage, includeMissingCaptionTimeline } from '@/lib/quality-audit';
+import { timelineFromSourceClaims, timelineFromEvidenceNotes } from '@/lib/timeline-granularity';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -15,7 +16,8 @@ const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한
 
 작업 규칙:
 1. **반드시 영상 마지막까지 검토**한다. 초반 개념에 토큰을 소진하지 말고 0~25%, 25~50%, 50~75%, 75~100% 구간의 발언에서 새로운 정보가 등장하는지 차례대로 검토한다. 후반의 새로운 증상·비교·구별법·결론을 놓치지 않는다.
-2. 우선 타임라인을 만든다. 한 영상 구간에서 별개의 주장·사례·상황이 나오면 별개의 타임라인 항목으로 기록한다. 3~5분 정보 중심 영상이라면 실제 논점이 있을 때 약 7~14개의 타임라인을 목표로 한다. 각 항목은 구체적 실제 발언 1~3문장으로 기술한다. 도입/정의/기전/사례 같은 추상적 제목만 반복하지 않는다.
+2. **타임라인은 문장/의미 전환마다 하나씩** 만든다. 한 문단에 정의·비유·원인·사례·증상·구별법을 합치지 않는다. 3~5분 정보 중심 영상은 충분한 발언이 실제 있으면 약 10~16개를 목표로 한다. 시간 근거 하나당 확인 가능한 핵심 발언 한 개만 1~2문장으로 기록한다. 시점을 임의로 배분하지 않고 각 항목의 evidenceIds에 실제 그 발언이 시작한 근거를 연결한다. 00:33과 00:49에 서로 다른 발언이 있으면 두 개 항목으로 나눈다. 확인할 수 있는 근거가 없으면 숫자를 맞추려고 채우지 않는다.
+2-1. evidence[]는 가능한 한 발언 하나당 하나의 좁은 실제 구간을 만들고 note에는 **그 구간에 해당하는 구체적인 발언 내용**을 1문장으로 적는다. 여러 다른 시점을 하나의 evidence에 합치지 않는다. 이를 확인할 수 없으면 세부 시간을 추측하지 말고 원래 확인된 넓은 구간을 사용한다.
 3. summary는 타임라인의 세부 논점을 논리별로 묶은 **서로 다른 요점 3~6개**로 구성한다. 각 요점은 고유한 주장 + 영상의 이유 또는 구체적인 사례를 2~3문장으로 쓴다.
 4. article은 한 줄씩 복사한 항목집이 아니라 영상 원문을 토대로 이어지는 **설명형 완성 아티클**이다. 실제 확인한 (a) 정의·비유 (b) 원인 및 다른 가능성 (c) 사례 (d) 증상과 혼동하기 쉬운 내용의 차이 (e) 화자의 결론 중 영상에 나온 소재만 사용해 3~6개의 의미 있는 소제목으로 나눈다. 항목별 본문은 실제 정보가 있으면 여러 개의 자연스러운 문단으로 쓰고 같은 문장을 반복하지 않는다.
 5. 모든 summary·timeline·article 항목에 evidenceIds를 연결한다. 존재하는 영상의 실제 발언 시간만 적고 없거나 불확실한 시간·수치·주장을 만들지 않는다. 발표자의 의학적·통계적 주장과 별도로 검증된 과학적 사실을 구분한다.
@@ -64,9 +66,9 @@ const analysisFormat = {
             schema: {
               type: 'object',
               properties: {
-                evidence: { type: 'array', description: '각 주장과 연결할 실제 영상 구간. 근거 없는 구간은 만들지 마세요.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind'] } },
+                evidence: { type: 'array', description: '서로 다른 발언마다 실제 확인한 좁은 시간 구간과 구체적인 근거 노트를 기록. 모르는 시각은 추측 금지.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind','note'] } },
                 summary: { type: 'array', description: '핵심 주장별 분리된 상세 요약 목록. 각 text는 여러 문장.', items: { type: 'object', properties: {id: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','text','evidenceIds'] } },
-                timeline: { type: 'array', description: '내용 변화 시점별 실제 세부 타임라인. 각 text는 2~4문장.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
+                timeline: { type: 'array', description: '실제 발언의 의미가 바뀌는 시점마다 한 항목. 하나의 사실/발언만 1~2문장, 개별 근거시간 연결. 서로 다른 시점을 하나로 묶지 말 것.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
                 article: { type: 'array', description: '긴 호흡의 해설 문서: 소제목별 여러 문단을 개행 두 번으로 구분.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
                 transcript: { type: 'array', description: '실제 원문 발화를 확인한 경우에만 작성. 확인 불가시 빈 배열.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
                 exclusions: {type: 'array', items: {type: 'string'}},
@@ -209,7 +211,12 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
       console.warn(JSON.stringify({event:'analysis.article_detail_unavailable',requestId,code:detailError instanceof ServiceError?detailError.code:'INVALID_OR_TIMEOUT'}));
     }
   }
+  // Restore atomic time-aligned claims when a composed timeline merged multiple
+  // source moments into a single paragraph; no additional Gemini request.
+  const timelineBefore = content.timeline.length;
+  content = {...content, timeline: timelineFromSourceClaims(source.claims,source.evidence,content.timeline)};
   if(provided) content=includeMissingCaptionTimeline(source,content);
+  console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:provided?'user-captions':'video-url',before:timelineBefore,after:content.timeline.length}));
   const audit=assessSourceCoverage(source,content,video.durationSeconds,composed);
   if(composeRecovery)audit.qualityStatus='partial';
   if(audit.sourceIncomplete) content.exclusions.push('1차 근거 자료가 영상 전체를 충분히 대표하지 못할 수 있습니다. 후반부의 증상·비교·결론 등을 직접 확인하세요.');
@@ -236,6 +243,9 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
     try {
       const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'text',text:prompt+'\n'+detailInstructions},{type:'video',uri:video.url}],signal,timeoutMs:attempts[i]});
       const result=convert(response.parsed,video,model);
+      const timelineBefore=result.original.timeline.length;
+      result.original.timeline=timelineFromEvidenceNotes(result.original.timeline,result.evidence);
+      console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:'video-url',before:timelineBefore,after:result.original.timeline.length}));
       const audit=assessSinglePassCoverage(result.evidence,result.original,video.durationSeconds);
       result.analysisMeta={depth:'standard',providerCalls:i+1,refinement:'not-needed',pipeline:'single-pass',qualityStatus:audit.incomplete?'partial':'review',sourceEndPercent:audit.lastTimelinePercent};
       if(audit.incomplete)result.original.exclusions.push(`영상 후반부 및 타임라인의 시간 분포가 불충분합니다(마지막 타임라인 근거 시작: 약 ${audit.lastTimelinePercent}%). 표시된 내용은 부분 분석이며 누락 내용을 임의로 보완하지 않았습니다.`);

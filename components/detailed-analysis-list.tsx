@@ -1,6 +1,7 @@
 'use client';
 import type { Evidence, GroundedItem, TranscriptLine } from '@/lib/types';
 import { timestamp } from '@/lib/youtube';
+import { timelineTime } from '@/lib/timeline-granularity';
 
 type Tab = 'summary' | 'timeline' | 'article' | 'transcript';
 export function DetailedAnalysisList({
@@ -24,6 +25,28 @@ export function DetailedAnalysisList({
         return getStart(left) - getStart(right);
       })
     : items;
+
+  // Chronological transcript-like layout: one verified moment per row, not a
+  // large topic card. A repeated time means the source did not provide a more
+  // precise timestamp; we never interpolate exact seconds.
+  if (tab === 'timeline') return <ol className="divide-y divide-slate-800/80" aria-label="발언별 타임라인">
+    {ordered.map(item => {
+      const isTranscript = 'startSeconds' in item;
+      const refs = isTranscript ? [] : item.evidenceIds.map(id => evidenceMap.get(id)).filter((v): v is Evidence => v !== undefined);
+      const start = isTranscript ? item.startSeconds : refs.length ? Math.min(...refs.map(ref => ref.startSeconds)) : null;
+      const title = isTranscript ? '' : item.title ?? '';
+      const more = refs.filter(ref => start !== null && Math.abs(ref.startSeconds-start)>1);
+      return <li key={item.id} className="grid grid-cols-[62px_minmax(0,1fr)] gap-3 py-4 first:pt-0 sm:grid-cols-[76px_minmax(0,1fr)] sm:gap-4">
+        <div className="pt-0.5">{start !== null && <button type="button" onClick={() => onSeek(start)} aria-label={`${timelineTime(start)}부터 영상 재생`} title="해당 시간의 영상 재생" className="rounded-md bg-indigo-500/15 px-2 py-1 text-xs font-semibold tabular-nums text-indigo-200 hover:bg-indigo-500/25">{timelineTime(start)}</button>}</div>
+        <div className="min-w-0 space-y-2">
+          {editing && !isTranscript ? <input aria-label="타임라인 제목 편집" value={title} onChange={event => onTitleChange(item.id,event.target.value)} className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-semibold text-slate-100"/> : title ? <h3 className="text-sm font-semibold leading-6 text-slate-100">{title}</h3> : null}
+          {editing ? <textarea aria-label="타임라인 내용 편집" value={item.text} onChange={event=>onTextChange(item.id,event.target.value)} className="min-h-24 w-full rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm leading-7 text-slate-100"/> : <p className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-300">{item.text}</p>}
+          {item.edited && <p className="text-xs text-amber-300">사용자 수정본 · 원본 영상 확인 필요</p>}
+          {more.length>0 && <div className="flex flex-wrap gap-2" aria-label="같은 발언의 추가 근거">{more.map(ref=><button key={ref.id} type="button" onClick={()=>onSeek(ref.startSeconds)} className="rounded-md border border-indigo-500/20 px-2 py-1 text-[11px] tabular-nums text-indigo-300" title={ref.note||'추가 근거 재생'}>↳ {timelineTime(ref.startSeconds)}</button>)}</div>}
+        </div>
+      </li>;
+    })}
+  </ol>;
 
   return <div className={tab === 'article' ? 'space-y-9' : 'space-y-3'}>
     {ordered.map((item, index) => {

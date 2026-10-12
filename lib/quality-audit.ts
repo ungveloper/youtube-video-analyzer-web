@@ -40,7 +40,7 @@ export function assessSinglePassCoverage(evidence:SourceMap['evidence'], content
   const buckets=new Set(referenced.map(e=>Math.min(3,Math.floor(e.startSeconds / duration * 4))));
   const latestStart=Math.max(0,...referenced.map(e=>e.startSeconds));
   const lastTimelinePercent=duration?Math.round(latestStart/duration*100):0;
-  const expectedTimeline=duration<=300?6:duration<=900?9:12;
+  const expectedTimeline=duration<=300?9:duration<=900?12:16;
   const incomplete=content.timeline.length<expectedTimeline || buckets.size<4 || lastTimelinePercent<76;
   return {incomplete,lastTimelinePercent,buckets:buckets.size,timelineCount:content.timeline.length};
 }

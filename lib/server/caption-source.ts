@@ -5,7 +5,10 @@ import { parseTimedCaptions } from '@/lib/caption-input';
 
 export function sourceFromUserCaptions(raw:string,video:VideoInfo):SourceMap {
   const cues=parseTimedCaptions(raw,video.durationSeconds);
-  const windowSeconds=video.durationSeconds<=300?16:video.durationSeconds<=900?32:48;
+  // Prefer speech/sentence boundaries over broad topic windows. Cue timestamps are
+  // authoritative; never interpolate a new time inside a cue. Short fragmented
+  // automatic captions may be joined until a sentence ends or a small window fills.
+  const windowSeconds=video.durationSeconds<=300?11:video.durationSeconds<=900?18:26;
   const evidence:SourceMap['evidence']=[];
   const claims:SourceClaim[]=[];
   let group:typeof cues=[];
@@ -21,7 +24,16 @@ export function sourceFromUserCaptions(raw:string,video:VideoInfo):SourceMap {
     group=[];
   };
   for(const cue of cues){
-    if(group.length && (cue.endSeconds-group[0].startSeconds>windowSeconds || group.map(x=>x.text.length).reduce((a,b)=>a+b,0)+cue.text.length>1000)) flush();
+    const textLength=group.reduce((sum,item)=>sum+item.text.length,0);
+    const last=group.at(-1);
+    const currentEndsSentence=last ? /[.!?。！？]["'”’)]?$/.test(last.text.trim()) : false;
+    const silence=last ? cue.startSeconds-last.endSeconds>3 : false;
+    if(group.length && (
+      silence ||
+      (currentEndsSentence && textLength >= 8) ||
+      cue.endSeconds-group[0].startSeconds>windowSeconds ||
+      textLength+cue.text.length>180
+    )) flush();
     group.push(cue);
   }
   flush();
