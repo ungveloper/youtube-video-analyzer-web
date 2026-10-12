@@ -30,7 +30,8 @@ const richArticle='실제 확인된 발언에 근거한 독립적인 설명 문�
 const rich={summary:source.claims.slice(0,4).map((c,i)=>({id:`s${i}`,title:'요점',text:c.text,evidenceIds:c.evidenceIds})),timeline:source.claims.map((c,i)=>({id:`t${i}`,title:c.category,text:c.text,evidenceIds:c.evidenceIds})),article:[{id:'a1',title:'발언의 맥락과 비교',text:richArticle,evidenceIds:source.evidence.map(e=>e.id)}],transcript:[],exclusions:[]};
 assert.equal(assessSourceCoverage(source,rich,202,true).qualityStatus,'review');
 const early=sourceAt([0,13,31,50,65,82,91,120]);
-assert.equal(assessSourceCoverage(early,rich,202,true).qualityStatus,'partial','missing final part must be flagged');
+assert.equal(assessSourceCoverage(early,rich,202,true).sourceIncomplete,true,'sparse final portion is an advisory');
+assert.equal(assessSourceCoverage(early,rich,202,true).qualityStatus,'review','time distribution alone is not proof of article failure');
 const duplicate={...rich,article:rich.timeline.map(x=>({...x}))};
 assert.equal(assessSourceCoverage(source,duplicate,202,true).duplicatedArticle,true,'copied timeline cannot pass as article');
 const composed=extractComposedContent({summary:[{text:'요점',claimIds:['c0']}],timeline:[{text:'타임라인',title:'비교',claimIds:['c1']}],article:[{text:'해설',title:'제목',claimIds:['c2']}]},source);

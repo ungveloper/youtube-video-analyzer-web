@@ -5,6 +5,14 @@ export type AtomicClaim = { id: string; text: string; evidenceIds: string[]; cat
 const clean = (s: string): string => s.replace(/\s+/g, ' ').trim();
 const signature = (s: string): string => clean(s).replace(/[\s.,!?。·:;…“”\"'’]/g, '').toLowerCase();
 const meaningful = (text: string): boolean => clean(text).length >= 14 && /[가-힣A-Za-z0-9]/.test(text);
+const totalChars = (items: GroundedItem[]): number => items.reduce((n, item) => n + clean(item.text).length, 0);
+/** Reject a granularity transformation that destroys explanations to gain row count. */
+export function preserveTimelineDetail(original: GroundedItem[], candidate: GroundedItem[], minRatio = 0.85): GroundedItem[] {
+  if (!candidate.length) return original;
+  if (!original.length) return candidate;
+  if (candidate.length < original.length || totalChars(candidate) < totalChars(original) * minRatio) return original;
+  return candidate;
+}
 
 /** Always display a verified start time; for videos shorter than an hour, 00:00. */
 export function timelineTime(seconds: number): string {
@@ -46,7 +54,7 @@ export function timelineFromSourceClaims(claims: AtomicClaim[], evidence: Eviden
   }
   // If a source map was too coarse, prefer the existing verified timeline rather
   // than replacing a richer result with fewer lines.
-  return atomic.length >= authored.length && atomic.length > 0 ? order(atomic, evidence) : order(authored, evidence);
+  return order(preserveTimelineDetail(authored, atomic), evidence);
 }
 
 /**
@@ -79,5 +87,5 @@ export function timelineFromEvidenceNotes(authored: GroundedItem[], evidence: Ev
     const key = item.evidenceIds.slice().sort().join('|') + ':' + signature(item.text);
     if (!unique.has(key)) unique.set(key, item);
   });
-  return order([...unique.values()], evidence);
+  return order(preserveTimelineDetail(authored, [...unique.values()]), evidence);
 }

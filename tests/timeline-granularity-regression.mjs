@@ -12,7 +12,7 @@ function load(file,dependencies={}){
   Function('exports','require','module',built.outputText)(exports,(id)=>{if(!(id in dependencies))throw new Error(`Unexpected import: ${id}`);return dependencies[id]},{exports});
   return exports;
 }
-const {timelineTime,timelineFromSourceClaims,timelineFromEvidenceNotes}=load('lib/timeline-granularity.ts');
+const {timelineTime,timelineFromSourceClaims,timelineFromEvidenceNotes,preserveTimelineDetail}=load('lib/timeline-granularity.ts');
 const {parseTimedCaptions}=load('lib/caption-input.ts');
 assert.equal(timelineTime(0),'00:00');
 assert.equal(timelineTime(33.9),'00:33');
@@ -31,6 +31,9 @@ const coarse=timelineFromSourceClaims(claims.slice(0,1),evidence,authored);
 assert.equal(coarse.length,2,'never replace a detailed timeline with fewer claims');
 const standard=timelineFromEvidenceNotes(authored,evidence);
 assert.equal(standard.length,9,'evidence notes split independently anchored moments');
+const richOriginal=[{id:'a',title:'상세 설명',text:'영상의 인과 관계와 구체적 비교 설명이 충분히 작성되어 있습니다. '.repeat(14),evidenceIds:['e0','e1']}];
+const tinyAtomic=claims.slice(0,2).map((c,i)=>({id:c.id,title:'',text:c.text,evidenceIds:[`e${i}`]}));
+assert.deepEqual(preserveTimelineDetail(richOriginal,tinyAtomic),richOriginal,'never discard detailed source paragraphs in favor of shorter atomized lines');
 const noteLess=timelineFromEvidenceNotes([authored[0]],evidence.map((e,i)=>({...e,note:i===2?'':'짧음'})));
 assert.equal(noteLess.length,1,'never fabricate content when evidence note is absent');
 const {sourceFromUserCaptions}=load('lib/server/caption-source.ts',{'@/lib/caption-input':{parseTimedCaptions}});

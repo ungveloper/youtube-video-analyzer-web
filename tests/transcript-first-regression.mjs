@@ -28,7 +28,9 @@ function assess(times){
  const content={summary:[],article:[],transcript:[],exclusions:[],timeline:evidence.map((e,i)=>({id:`t${i}`,title:'제목',text:'발언',evidenceIds:[e.id]}))};
  return assessSinglePassCoverage(evidence,content,202);
 }
-assert.equal(assess([0,13,35,65,105,120]).incomplete,true,'missing final quarter cannot pass');
+assert.equal(assess([0,13,35,65,105,120]).needsReview,true,'missing final quarter needs manual review');
+assert.equal(assess([0,13,35,65,105,120]).incomplete,false,'uncertain final quarter is not proof of a failed analysis');
+assert.equal(assess([0,13,35,65,80]).incomplete,true,'a severe tail gap should be marked partial');
 assert.equal(assess([0,22,33,52,85,115,132,143,180]).incomplete,false,'full coverage passes');
 const ai=fs.readFileSync(path.join(root,'lib/server/ai.ts'),'utf8');
 assert.match(ai,/if\(provided\)\{/);
