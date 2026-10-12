@@ -6,6 +6,8 @@ import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
 import { assessDetail, detailTargets } from '@/lib/analysis-detail';
 import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat } from '@/lib/server/evidence-pipeline';
+import { sourceFromUserCaptions, trustedCaptionClaims, captionClaimPrompt } from '@/lib/server/caption-source';
+import { assessSourceCoverage, includeMissingCaptionTimeline } from '@/lib/quality-audit';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `너는 교육·지식 콘텐츠 전문 한국어 영상 분석 편집자다. 입력한 YouTube 영상 자체를 분석하여 사용자가 영상 없이도 논지, 설명 과정, 구체적인 근거를 이해할 수 있는 고밀도 해설을 작성한다.
@@ -113,13 +115,14 @@ function recordFromContent(video:VideoInfo,model:string,evidence:Evidence[],cont
   const now=new Date().toISOString();
   return {id:crypto.randomUUID(),video,createdAt:now,updatedAt:now,model,evidence,original:content,edited:structuredClone(content)};
 }
-async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal):Promise<AnalysisRecord>{
+async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,captionText?:string):Promise<AnalysisRecord>{
   // Source extraction is the expensive video-bearing request. Most analyses
   // use exactly two provider calls (video + text). On transient 5xx/timeouts,
   // retry ONLY this step once, retaining the user-selected model. In that case
   // deep mode uses at most three calls; never auto-switch to a paid model.
   let stage1: Awaited<ReturnType<typeof interaction>> | null = null;
   let sourceCalls = 0;
+  const provided = captionText?.trim() ? sourceFromUserCaptions(captionText,video) : null;
   for (let retry = 0; retry < 2; retry++) {
     if (signal?.aborted) throw new ServiceError('CANCELLED', '분석이 중단되었습니다.', 499);
     sourceCalls++;
@@ -132,8 +135,8 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     });
     try {
       stage1=await interaction({
-        key,model,requestId,pass:'source-map',format:sourceResponseFormat,
-        input:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],
+        key,model,requestId,pass:provided?'caption-claims':'source-map',format:sourceResponseFormat,
+        input:provided?[{type:'text',text:captionClaimPrompt(provided)}]:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],
         signal,timeoutMs:125000,
         // Video extraction is simpler than final composition; lower thinking
         // reduces reasoning overhead without changing the selected model.
@@ -156,12 +159,16 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
         throw new ServiceError('PROVIDER_TEMPORARY',
           `선택한 ${model} 모델의 영상 입력 처리에서 Google 서버 오류가 ${sourceCalls}회 발생했습니다. 잠시 후 다시 시도하거나, 화면에서 Gemini 3.5 Flash-Lite를 직접 선택해 비교해주세요. 자동 유료 모델 전환은 하지 않습니다. 마지막 오류: ${converted.message}`,502);
       }
+      if (provided && retry===1 && retryable) {
+        console.warn(JSON.stringify({event:'analysis.caption_claims_fallback',requestId,model,reason:'MODEL_TRANSIENT'}));
+        break; // The deterministic timed-caption evidence still exists.
+      }
       throw converted;
     }
   }
-  if (!stage1) throw new ServiceError('PROVIDER_UNAVAILABLE','근거 추출 결과가 없습니다.',502);
+  if (!stage1 && !provided) throw new ServiceError('PROVIDER_UNAVAILABLE','근거 추출 결과가 없습니다.',502);
   let source;
-  try { source=parseSourceMap(stage1.parsed,video); }
+  try { source=provided?(stage1?trustedCaptionClaims(stage1.parsed,provided):provided):parseSourceMap(stage1!.parsed,video); }
   catch(error){throw new ServiceError('INVALID_SOURCE_MAP',error instanceof Error?error.message:'원본 근거를 추출하지 못했습니다.',502);}
   onProgress({type:'progress',step:3,attempt:sourceCalls+1,label:'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
   let content:AnalysisContent;
@@ -181,17 +188,20 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     content=fallbackFromSource(source);
     onProgress({type:'progress',step:3,label:'근거 추출 결과 제공',detail:'상세 문서 생성에 실패하여 1차 근거 요지를 안전하게 표시합니다.'});
   }
+  if(provided) content=includeMissingCaptionTimeline(source,content);
+  const audit=assessSourceCoverage(source,content,video.durationSeconds,composed);
+  if(audit.qualityStatus==='partial') content.exclusions.push('근거 또는 설명 범위가 충분하지 않아 이 결과는 부분 분석입니다. 실제 영상과 대조해주세요.');
   const result=recordFromContent(video,model,source.evidence,content);
-  result.analysisMeta={depth:'deep',providerCalls:sourceCalls+1,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length};
+  result.analysisMeta={depth:'deep',providerCalls:sourceCalls+1,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length, sourceMode:provided?'user-captions':'video-url', qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent};
   onProgress({type:'progress',step:4,label:'근거 연결 검사 완료',detail:'존재하는 근거 ID·시간 범위를 확인했습니다. 사실 일치는 원본 대조가 필요합니다.'});
   const quality=assessDetail(content,video.durationSeconds);
-  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+1,sourceCalls,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1.tokens.input,firstOutputTokens:stage1.tokens.output,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
+  console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+1,sourceCalls,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent}));
   return result;
 }
-export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL):Promise<AnalysisRecord>{
+export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string):Promise<AnalysisRecord>{
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);
-  if(depth==='deep')return deepAnalysis(video,model,key,requestId,onProgress,signal);
+  if(depth==='deep' || captionText?.trim())return deepAnalysis(video,model,key,requestId,onProgress,signal,captionText);
   const targets=detailTargets(video.durationSeconds);
   const detailInstructions=`영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
   const attempts=[110000,75000];let lastError:unknown;

@@ -4,6 +4,8 @@ import Link from 'next/link';
 import { Badge,Button,Card,Tabs } from '@/components/ui/primitives';
 import { DetailedAnalysisList } from '@/components/detailed-analysis-list';
 import { YouTubePlayerEmbed } from '@/components/youtube-player';
+import { CaptionInputPanel } from '@/components/caption-input-panel';
+import { parseTimedCaptions } from '@/lib/caption-input';
 import type { YouTubePlayerHandle } from '@/components/youtube-player';
 import { assessDetail } from '@/lib/analysis-detail';
 import { FREE_MODELS, FREE_MODEL, type FreeModelId } from '@/lib/free-models';
@@ -26,6 +28,8 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   const playerRef=useRef<YouTubePlayerHandle|null>(null);
   const [depth,setDepth]=useState<'standard'|'deep'>('deep');
   const [model,setModel]=useState<FreeModelId>(FREE_MODEL);
+  const [captionText,setCaptionText]=useState('');
+  const captionCheck=useMemo(()=>{if(!captionText.trim())return true;if(!video)return false;try{parseTimedCaptions(captionText,video.durationSeconds);return true;}catch{return false;}},[captionText,video]);
   const [saveState,setSaveState]=useState('');
   const [progress,setProgress]=useState<AnalysisProgress|null>(null);
   const [elapsed,setElapsed]=useState(0);
@@ -61,15 +65,15 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   void init();return()=>{active=false};},[videoId,valid,loadQuota]);
   const seek=useCallback((time:number)=>{playerRef.current?.seekAndPlay(time);},[]);
   async function begin(){
-    if(!video||phase==='processing')return;
-    if(record&&!confirm(`새로운 무료 API 요청을 보냅니다. ${depth==='deep'?'정밀 분석은 2회':'기본 분석은 1회'} 호출합니다. 기존 결과는 브라우저에 남아있습니다. 다시 분석할까요?`))return;
+    if(!video||phase==='processing'||!captionCheck)return;
+    if(record&&!confirm(`새로운 무료 API 요청을 보냅니다. ${captionText.trim()?'자막 기반 분석은 정상 2회':depth==='deep'?'정밀 분석은 2회':'기본 분석은 1회'} 호출합니다. 기존 결과는 브라우저에 남아있습니다. 다시 분석할까요?`))return;
     const controller=new AbortController();requestController.current=controller;
     const requestId=crypto.randomUUID();
     setPhase('processing');setMessage('분석 요청을 준비하고 있습니다.');setWarning('');setFailure('');setEditing(false);
     setProgress({type:'progress',step:0,label:'분석 시작',detail:'서버에 요청을 전달하는 중입니다.'});
     setElapsed(0);setStartedAt(Date.now());
     try{
-      const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({videoId:video.id,requestId,depth,model}),signal:controller.signal,cache:'no-store'});
+      const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({videoId:video.id,requestId,depth:captionText.trim()?'deep':depth,model,captionText:captionText.trim()||undefined}),signal:controller.signal,cache:'no-store'});
       const result=await readAnalysisEvents(res,event=>{
         if(controller.signal.aborted)return;
         setProgress(event);
@@ -118,13 +122,14 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
         </div>}
         <div className="mt-4 space-y-2 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><label htmlFor="free-model-select" className="block text-xs font-semibold text-slate-200">무료 Gemini 모델</label><select id="free-model-select" value={model} disabled={phase==='processing'} onChange={e=>{setModel(e.target.value as FreeModelId);setDiagnostic('');}} className="w-full rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs text-slate-100">{FREE_MODELS.map(item=><option value={item.id} key={item.id}>{item.name}</option>)}</select><p className="text-xs leading-5 text-slate-500">선택한 모델의 Free Tier 사용 가능 여부는 AI Studio 프로젝트에서 확인해야 합니다. 유료 등급 키는 사용하지 마세요. 자동 유료 전환은 없습니다.</p></div>
         <div className="mt-4 space-y-2 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><p className="text-xs font-semibold text-slate-200">분석 깊이</p><div className="grid grid-cols-2 gap-2" role="group" aria-label="AI 분석 깊이 선택"><button type="button" aria-pressed={depth==='standard'} disabled={phase==='processing'} onClick={()=>setDepth('standard')} className={`rounded-lg border px-3 py-2 text-xs font-semibold ${depth==='standard'?'border-indigo-400 bg-indigo-500/20 text-indigo-100':'border-slate-700 text-slate-400'}`}>기본 · 1회 호출</button><button type="button" aria-pressed={depth==='deep'} disabled={phase==='processing'} onClick={()=>setDepth('deep')} className={`rounded-lg border px-3 py-2 text-xs font-semibold ${depth==='deep'?'border-indigo-400 bg-indigo-500/20 text-indigo-100':'border-slate-700 text-slate-400'}`}>정밀 · 정상 2회</button></div><p className="text-xs leading-5 text-slate-500">정밀 분석은 정상 시 영상 근거 추출 1회 + 텍스트 상세 작성 1회입니다. Google HTTP 5xx 또는 시간 초과가 발생하면 근거 추출을 최대 한 번 재시도하여 총 3회까지 호출할 수 있습니다. 429는 재시도하지 않으며 유료 모델로 자동 전환하지 않습니다.</p></div>
-        <Button className="mt-4 w-full" onClick={begin} disabled={!video||phase==='processing'||phase==='checking'||phase==='error'||(quota?.enabled!==true)}>{phase==='processing'?<><span aria-hidden="true" className="mr-2 inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"/>분석 요청 처리 중…</>:record?`다시 분석 (${depth==='deep'?'정상 2회·오류 시 최대 3회':'1회'} 무료 호출)`:`${depth==='deep'?'정밀':'기본'} AI 분석 시작`}</Button>
+        <CaptionInputPanel value={captionText} onChange={v=>{setCaptionText(v);if(v.trim())setDepth('deep');}} duration={video?.durationSeconds||0} disabled={phase==='processing'}/>
+        <Button className="mt-4 w-full" onClick={begin} disabled={!video||!captionCheck||phase==='processing'||phase==='checking'||phase==='error'||(quota?.enabled!==true)}>{phase==='processing'?<><span aria-hidden="true" className="mr-2 inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"/>분석 요청 처리 중…</>:record?`다시 분석 (${depth==='deep'?'정상 2회·오류 시 최대 3회':'1회'} 무료 호출)`:`${depth==='deep'?'정밀':'기본'} AI 분석 시작`}</Button>
         <Button type="button" variant="secondary" className="mt-2 w-full" disabled={diagnosticBusy||phase==='processing'} onClick={diagnose}>{diagnosticBusy?'모델 연결 확인 중…':'무료 모델 연결 진단 (AI 분석 호출 없음)'}</Button>
         {diagnostic&&<p role="status" className="mt-2 break-words rounded-lg border border-slate-700 bg-slate-950/60 p-3 text-xs leading-6 text-slate-300">{diagnostic}</p>}
         {record&&<p className="mt-3 text-xs text-slate-500">기존 결과 재열람은 API를 호출하지 않습니다. 새 분석은 무료 등급 요청 한도를 사용합니다.</p>}</Card>
-        <Card className="p-5 text-xs leading-6 text-slate-400"><p className="font-semibold text-slate-200">중요 안내</p><p className="mt-2">AI 분석은 원본 내용을 완벽하게 보증하지 않습니다. 시간 근거는 반드시 영상을 재생해 확인하세요. 원문을 확보하지 못한 경우 스크립트를 만들지 않습니다.</p><p className="mt-2">브라우저를 닫으면 진행 중인 분석 결과가 유실될 수 있습니다.</p></Card>
+        <Card className="p-5 text-xs leading-6 text-slate-400"><p className="font-semibold text-slate-200">중요 안내</p><p className="mt-2">AI 분석은 원본 내용을 완벽하게 보증하지 않습니다. 시간 근거는 반드시 영상을 재생해 확인하세요. 원문을 확보하지 못한 경우 스크립트를 만들지 않습니다.</p><p className="mt-2">라이브위키는 공개 설명상 자막 중심으로 요약합니다. 자막 없이 영상 URL만 분석하면 같은 상세도를 보장할 수 없습니다. 근거 참조율은 사실 정확도가 아닙니다.</p><p className="mt-2">브라우저를 닫으면 진행 중인 분석 결과가 유실될 수 있습니다.</p></Card>
       </div>
-      <Card className="min-w-0 overflow-hidden"><div className="border-b border-slate-800 p-4 sm:p-5"><div className="flex flex-wrap items-center justify-between gap-2"><div><h2 className="font-semibold">분석 결과</h2><p className="mt-1 text-xs text-slate-500">한국어 · 근거 연결 · 상세 해설 · 브라우저 저장</p></div>{record&&<Badge>{changed?'사용자 편집본':'AI 원본'}</Badge>}</div>{record?.analysisMeta&&<p className="mt-2 text-xs text-slate-400">{record.analysisMeta.depth==='deep'?'정밀 분석':'기본 분석'} · {record.model} · 실제 무료 AI 호출 {record.analysisMeta.providerCalls}회{record.analysisMeta.refinement==='improved'?' · 근거 추출 → 상세 문서 완성':record.analysisMeta.refinement==='kept-first'?' · 문서 생성 실패: 근거 요지만 제공':''}{record.analysisMeta.sourceClaims?` · 확인된 논점 ${record.analysisMeta.sourceClaims}개`:''}</p>}<div className="mt-4"><Tabs value={tab} onChange={v=>{setTab(v as Tab);setEditing(false)}} items={labeledTabs}/></div></div>
+      <Card className="min-w-0 overflow-hidden"><div className="border-b border-slate-800 p-4 sm:p-5"><div className="flex flex-wrap items-center justify-between gap-2"><div><h2 className="font-semibold">분석 결과</h2><p className="mt-1 text-xs text-slate-500">한국어 · 근거 연결 · 상세 해설 · 브라우저 저장</p></div>{record&&<Badge>{changed?'사용자 편집본':'AI 원본'}</Badge>}</div>{record?.analysisMeta&&<p className="mt-2 text-xs text-slate-400">{record.analysisMeta.depth==='deep'?'정밀 분석':'기본 분석'} · {record.model} · 실제 무료 AI 호출 {record.analysisMeta.providerCalls}회{record.analysisMeta.refinement==='improved'?' · 근거 추출 → 상세 문서 완성':record.analysisMeta.refinement==='kept-first'?' · 문서 생성 실패: 근거 요지만 제공':''}{record.analysisMeta.sourceClaims?` · 추출된 논점 ${record.analysisMeta.sourceClaims}개`:''}{record.analysisMeta.sourceMode==='user-captions'?' · 사용자 자막 기반':''}{record.analysisMeta.qualityStatus==='partial'?' · 부분 분석(원본 확인 필요)':''}{typeof record.analysisMeta.coveragePercent==='number'?` · 근거 참조율 ${record.analysisMeta.coveragePercent}%`:''}</p>}{record?.analysisMeta?.qualityStatus==='partial'&&<p role="status" className="mt-3 rounded-lg border border-amber-600/40 bg-amber-950/20 px-3 py-2 text-xs leading-6 text-amber-200">부분 분석: 제공된 입력에서 충분한 근거와 설명을 확보하지 못했습니다. 모델을 바꾸거나 사용 권한이 있는 시간 지정 자막을 제공하면 도움이 될 수 있습니다. 이 표시는 사실성 검증을 뜻하지 않습니다.</p>}<div className="mt-4"><Tabs value={tab} onChange={v=>{setTab(v as Tab);setEditing(false)}} items={labeledTabs}/></div></div>
         <div className="min-h-[350px] p-4 sm:p-6">{warning&&<div role="alert" className="mb-4 rounded-xl border border-amber-700/50 bg-amber-950/20 p-3 text-sm text-amber-200">{warning}</div>}
         {record&&density&&density.shortFields.length>0&&<div className="mb-5 rounded-xl border border-slate-700 bg-slate-900/70 p-4 text-xs leading-6 text-slate-300"><p className="font-semibold text-slate-100">영상 정보에 비해 분석이 간략할 수 있습니다</p><p className="mt-1">{density.shortFields.join(' · ')} 항목이 적거나 설명이 짧습니다. 실제 영상의 확인 가능한 발화가 적거나 AI 출력이 간결했을 수 있습니다. 정밀 분석은 영상 근거 추출과 텍스트 해설 작성을 분리하지만, 원본에서 확인되지 않은 내용은 생성하지 않습니다.</p></div>}
         {!record?<div className="flex min-h-[310px] flex-col items-center justify-center text-center"><div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10 text-3xl text-indigo-300">{phase==='processing'?<span aria-hidden="true" className="h-9 w-9 animate-spin rounded-full border-[3px] border-indigo-300/20 border-t-indigo-300"/>:'✦'}</div><h3 className="text-lg font-semibold">{phase==='processing'?'AI가 영상을 분석하고 있습니다':'아직 분석 결과가 없습니다'}</h3><p className="mt-3 max-w-sm text-sm leading-7 text-slate-400">{phase==='processing'?'진행 상태와 경과 시간을 왼쪽 패널에서 확인할 수 있습니다. 분석 중에는 이 화면을 유지해주세요.':'영상 정보를 확인하고 AI 분석을 시작하면 요약·타임라인·아티클·스크립트가 여기에 표시됩니다. 설정 전에는 가상 결과를 생성하지 않습니다.'}</p></div>:

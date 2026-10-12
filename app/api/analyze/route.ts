@@ -4,6 +4,7 @@ import { analyzeVideo } from '@/lib/server/ai';
 import { getVideo, ServiceError } from '@/lib/server/video';
 import { assertPersonalRequest, assertSameOrigin, personalModeStatus, freeModelId } from '@/lib/server/personal-mode';
 import type { AnalysisEvent, AnalysisProgress } from '@/lib/analysis-stream';
+import { MAX_CAPTION_CHARS } from '@/lib/caption-input';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -17,7 +18,9 @@ export async function POST(request: Request) {
     assertSameOrigin(request);
     const status = personalModeStatus();
     if (!status.enabled) throw new ServiceError('NOT_CONFIGURED', status.reason, 503);
-    const body = await request.json() as { videoId?: unknown; requestId?: unknown; depth?: unknown; model?: unknown };
+    const body = await request.json() as { videoId?: unknown; requestId?: unknown; depth?: unknown; model?: unknown; captionText?: unknown };
+    const captionText=typeof body.captionText==='string'?body.captionText:'';
+    if(captionText.length>MAX_CAPTION_CHARS || (body.captionText!==undefined && typeof body.captionText!=='string')) throw new ServiceError('CAPTION_TOO_LARGE','SRT/VTT 자막 입력 제한을 확인해주세요.',400);
     const videoId = typeof body.videoId === 'string' ? extractVideoId(body.videoId) : null;
     const requestId = typeof body.requestId === 'string' && /^[a-f0-9-]{36}$/i.test(body.requestId) ? body.requestId : null;
     const depth = body.depth === 'deep' ? 'deep' : 'standard';
@@ -53,7 +56,7 @@ export async function POST(request: Request) {
             const video = await getVideo(videoId);
             emit({type:'progress', step:2,label:'영상 확인 완료',detail:'무료 Gemini 모델에 영상 URL을 전달할 준비가 되었습니다.'});
             const onProgress = (event: AnalysisProgress) => emit(event);
-            const result = await analyzeVideo(video, requestId, onProgress, abortController.signal, depth, model);
+            const result = await analyzeVideo(video, requestId, onProgress, abortController.signal, depth, model, captionText);
             emit({type:'completed', analysis: result});
           } catch(error) {
             const code = error instanceof ServiceError ? error.code : 'ANALYSIS_ERROR';
