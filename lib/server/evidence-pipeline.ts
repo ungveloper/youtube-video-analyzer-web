@@ -81,7 +81,7 @@ export function fallbackFromSource(source:SourceMap):AnalysisContent {
 export function sourceMapPrompt(duration:number):string {
   const target=duration<=300?'10~20':duration<=900?'18~42':'32~85';
   const quarter=Math.round(duration/4);
-  return `영상 전체를 실제 처음부터 끝까지 검토해 한국어 발언 근거 맵을 작성한다. 문서 요약·아티클은 작성하지 말 것.
+  return `영상 전체의 음성 발언을 확인해 한국어 발언 근거 맵을 작성한다. 먼저 영상 마지막 1/3의 독립적인 발언과 결론을 확인한 뒤 처음으로 돌아와 시간순으로 결과를 정리한다. 후반부에 다른 증상·비교·경고가 있다면 반드시 기록한다. 문서 요약·아티클은 작성하지 말 것.
 영상 길이 ${duration}초. 특별히 다음 시간대의 내용을 빠뜨리지 않았는지 확인한다:
 - 0~${quarter}초: 도입·정의·첫 주장
 - ${quarter}~${quarter*2}초: 주제 확장·근거·예시
@@ -131,4 +131,40 @@ export function recoverArticleFromSource(raw:unknown, source:SourceMap):Analysis
   if (!article.length) throw new Error('복구된 아티클의 근거 ID가 올바르지 않습니다.');
   const baseline=fallbackFromSource(source);
   return {...baseline,article,exclusions:source.exclusions.slice()};
+}
+
+/** Merge only independently evidenced later-video statements; preserve the original ledger. */
+export function mergeFocusedTail(source: SourceMap, followUp: SourceMap, duration:number): {source:SourceMap;added:number} {
+ const threshold=duration*0.60;
+ const originalNotes=new Set(source.evidence.map(e=>(e.note||'').replace(/\s+/g,'').toLowerCase()));
+ const addedEvidence:Evidence[]=[];
+ const idMap=new Map<string,string>();
+ for(const [index,e] of followUp.evidence.entries()){
+   if(e.startSeconds<threshold || e.startSeconds>duration || !e.note?.trim())continue;
+   const sig=e.note.replace(/\s+/g,'').toLowerCase();
+   if(originalNotes.has(sig))continue;
+   if(source.evidence.some(o=>Math.abs(o.startSeconds-e.startSeconds)<1.5 && o.note===e.note))continue;
+   const id=`tail-e-${index}`;
+   idMap.set(e.id,id); originalNotes.add(sig);addedEvidence.push({...e,id});
+ }
+ const existingClaims=new Set(source.claims.map(c=>c.text.replace(/\s+/g,'').toLowerCase()));
+ const addedClaims:SourceClaim[]=[];
+ for(const [index,c] of followUp.claims.entries()){
+   const refs=c.evidenceIds.map(id=>idMap.get(id)).filter((id):id is string=>Boolean(id));
+   if(!refs.length)continue;
+   const sig=c.text.replace(/\s+/g,'').toLowerCase();
+   if(existingClaims.has(sig))continue;
+   existingClaims.add(sig);
+   addedClaims.push({...c,id:`tail-c-${index}`,evidenceIds:refs});
+ }
+ const used=new Set(addedClaims.flatMap(c=>c.evidenceIds));
+ return {source:{...source,evidence:[...source.evidence,...addedEvidence.filter(e=>used.has(e.id))],claims:[...source.claims,...addedClaims],exclusions:[...source.exclusions,...followUp.exclusions]},added:addedClaims.length};
+}
+
+/** Independent optional repair for deep mode only. One extra video request when no late anchors were found. */
+export function focusedTailPrompt(duration:number):string {
+ const start=Math.floor(duration*0.60); const mm=(v:number)=>`${String(Math.floor(v/60)).padStart(2,'0')}:${String(v%60).padStart(2,'0')}`;
+ return `앞선 영상 요약이 후반부 근거를 확보하지 못했다. 이 요청에서는 영상의 ${mm(start)}부터 ${mm(duration)}까지만 집중 확인한다. 영상 전체를 다시 요약하지 않는다.
+이 시간에 실제 발언된 새로운 주장, 증상, 구별법, 사례, 주의사항, 최종 결론을 하나의 발언마다 별도 claims/evidence로 JSON 작성하라. 전혀 발언이 없으면 빈 배열로 반환하라.
+근거 시각은 원본 영상 기준 초 단위 절대시각이다. 시간은 추측하지 말고 확인된 경우에만 쓴다. 출처 외 의료 사실을 새로 만들지 말라. transcript는 원문이 정확히 확인되지 않으면 []. exclusions를 포함해 source-map 형식으로 출력하라.`;
 }

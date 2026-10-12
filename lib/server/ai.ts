@@ -5,24 +5,25 @@ import { FREE_MODEL, type FreeModelId } from '@/lib/free-models';
 import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
 import { assessDetail, detailTargets } from '@/lib/analysis-detail';
-import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource } from '@/lib/server/evidence-pipeline';
+import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource, focusedTailPrompt, mergeFocusedTail } from '@/lib/server/evidence-pipeline';
 import { sourceFromUserCaptions } from '@/lib/server/caption-source';
 import { assessSourceCoverage, assessSinglePassCoverage, includeMissingCaptionTimeline } from '@/lib/quality-audit';
-import { timelineFromSourceClaims, timelineFromEvidenceNotes } from '@/lib/timeline-granularity';
+import { timelineFromSourceClaims, timelineFromEvidenceNotes, appendUnreferencedEvidenceNotes } from '@/lib/timeline-granularity';
+import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/temporal-coverage';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
 우선순위: **시청자가 영상을 보지 않아도 모든 논점과 비교·사례·경고를 이해하도록 빠짐없이 기록**한다. 길게 쓰는 척하기 위해 영상에 없는 내용은 추가하지 않는다.
 
 작업 규칙:
-1. **반드시 영상 마지막까지 검토**한다. 초반 개념에 토큰을 소진하지 말고 0~25%, 25~50%, 50~75%, 75~100% 구간의 발언에서 새로운 정보가 등장하는지 차례대로 검토한다. 후반의 새로운 증상·비교·구별법·결론을 놓치지 않는다.
+1. **먼저 영상 후반 50~100%를 살펴 새로운 발언·비교·예시·결론을 기록한 다음**, 처음으로 돌아와 0~25%,25~50%,50~75%,75~100% 전 구간을 순서대로 정리한다. 특히 영상 끝부분까지 논점이 바뀌는지 확인한다. 초반 개념에 출력 토큰을 소진하지 않는다.
 2. **타임라인은 문장/의미 전환마다 하나씩** 만든다. 한 문단에 정의·비유·원인·사례·증상·구별법을 합치지 않는다. 3~5분 정보 중심 영상은 충분한 발언이 실제 있으면 약 10~16개를 목표로 한다. 시간 근거 하나당 확인 가능한 핵심 발언 한 개만 1~2문장으로 기록한다. 시점을 임의로 배분하지 않고 각 항목의 evidenceIds에 실제 그 발언이 시작한 근거를 연결한다. 00:33과 00:49에 서로 다른 발언이 있으면 두 개 항목으로 나눈다. 확인할 수 있는 근거가 없으면 숫자를 맞추려고 채우지 않는다.
 2-1. evidence[]는 가능한 한 발언 하나당 하나의 좁은 실제 구간을 만들고 note에는 **그 구간에 해당하는 구체적인 발언 내용**을 1문장으로 적는다. 여러 다른 시점을 하나의 evidence에 합치지 않는다. 이를 확인할 수 없으면 세부 시간을 추측하지 말고 원래 확인된 넓은 구간을 사용한다.
 3. summary는 타임라인의 세부 논점을 논리별로 묶은 **서로 다른 요점 3~6개**로 구성한다. 각 요점은 고유한 주장 + 영상의 이유 또는 구체적인 사례를 2~3문장으로 쓴다.
 4. article은 한 줄씩 복사한 항목집이 아니라 영상 원문을 토대로 이어지는 **설명형 완성 아티클**이다. 실제 확인한 (a) 정의·비유 (b) 원인 및 다른 가능성 (c) 사례 (d) 증상과 혼동하기 쉬운 내용의 차이 (e) 화자의 결론 중 영상에 나온 소재만 사용해 3~6개의 의미 있는 소제목으로 나눈다. 항목별 본문은 실제 정보가 있으면 여러 개의 자연스러운 문단으로 쓰고 같은 문장을 반복하지 않는다.
 5. 모든 summary·timeline·article 항목에 evidenceIds를 연결한다. 존재하는 영상의 실제 발언 시간만 적고 없거나 불확실한 시간·수치·주장을 만들지 않는다. 발표자의 의학적·통계적 주장과 별도로 검증된 과학적 사실을 구분한다.
 6. transcript는 발언을 정확하게 전사했다고 확신할 때만 제공한다. 원문 확인이 불가능하면 []이고 생성한 해설을 발화문으로 둔갑시키지 않는다.
-7. 영상 **마지막 25%까지 근거가 도달하지 않았다면**, exclusions에 후반부 발언 확인이 어려웠다고 기록한다. 후반부 내용을 억지로 채우지 말라.
+7. 타임라인은 영상의 4개 구간을 독립적으로 검토하고, 구간마다 실제 발언된 새 정보가 있다면 반드시 기록한다. 마지막 구간의 발언을 확인할 수 없다면 exclusions에 남기고 시간을 지어내지 않는다.
 8. 출력은 제공된 JSON Schema를 지키는 한국어 JSON 한 개. 문서가 너무 짧아질 것 같으면 근거가 있는 타임라인 논점과 증상/차이점/결론의 누락을 우선 방지한다.
 `;
 export type InteractionResponse = {
@@ -81,7 +82,7 @@ const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
 }
-async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium';maxOutputTokens?:number}) {
+async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string;processing?:'agentic'}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium';maxOutputTokens?:number}) {
   const timeout=AbortSignal.timeout(args.timeoutMs);
   const signal=args.signal?AbortSignal.any([args.signal,timeout]):timeout;
   const started=Date.now();
@@ -131,7 +132,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
       sourceCalls++;
       onProgress({type:'progress',step:2,attempt:sourceCalls,label:retry===0?'1/2 · 영상 근거 추출':'1/2 · 영상 근거 추출 재시도',detail:retry===0?'영상 처음부터 끝까지 발언·사례·차이점·결론 근거를 추출합니다.':'일시적인 Google 오류로 잠시 기다린 뒤 한 번만 재시도합니다.'});
       try{
-        stage1=await interaction({key,model,requestId,pass:'source-map',format:sourceResponseFormat,input:[{type:'text',text:sourceMapPrompt(video.durationSeconds)},{type:'video',uri:video.url}],signal,timeoutMs:125000,thinkingLevel:'low'});
+        stage1=await interaction({key,model,requestId,pass:'source-map',format:sourceResponseFormat,input:[{type:'video',uri:video.url,...(model==='gemini-3.8-flash'?{processing:'agentic' as const}:{})},{type:'text',text:sourceMapPrompt(video.durationSeconds)}],signal,timeoutMs:125000,thinkingLevel:'low'});
         break;
       }catch(error){
         if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
@@ -149,6 +150,26 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     if(!stage1)throw new ServiceError('PROVIDER_UNAVAILABLE','영상에서 근거를 확보하지 못했습니다.',502);
     try{source=parseSourceMap(stage1.parsed,video);}
     catch(error){throw new ServiceError('INVALID_SOURCE_MAP',error instanceof Error?error.message:'영상 근거 추출에 실패했습니다.',502);}
+    // Explicit deep mode can spend one extra free video call only when the
+    // first source map contains no late-video anchor. If it fails, preserve
+    // the first source map and never invent late facts.
+    if(!hasLateAnchors(source.evidence,video.durationSeconds)){
+      onProgress({type:'progress',step:2,attempt:sourceCalls+1,label:'영상 후반부 근거 보완',detail:'첫 추출에서 후반부 발언이 빠져 정밀 모드에서만 영상 마지막 구간을 한 번 더 확인합니다. 무료 요청 1회가 추가됩니다.'});
+      sourceCalls++;
+      try{
+        const extra=await interaction({key,model,requestId,pass:'tail-scan',format:sourceResponseFormat,input:[{type:'video',uri:video.url,...(model==='gemini-3.8-flash'?{processing:'agentic' as const}:{})},{type:'text',text:focusedTailPrompt(video.durationSeconds)}],signal,timeoutMs:100000,thinkingLevel:'low',maxOutputTokens:9000});
+        const supplement=parseSourceMap(extra.parsed,video);
+        const merged=mergeFocusedTail(source,supplement,video.durationSeconds);
+        source=merged.source;
+        console.info(JSON.stringify({event:'analysis.tail_scan',requestId,model,addedClaims:merged.added,sourceClaims:source.claims.length}));
+      }catch(tailError){
+        if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+        // Respect the user's free-tier hard stop: do not submit the next compose
+        // request when Google has explicitly rejected quota for this project.
+        if(tailError instanceof ServiceError && tailError.code==='FREE_LIMIT')throw tailError;
+        console.warn(JSON.stringify({event:'analysis.tail_scan_unavailable',requestId,model,code:tailError instanceof ServiceError?tailError.code:'INVALID_SOURCE'}));
+      }
+    }
   }
   onProgress({type:'progress',step:3,attempt:sourceCalls+1,label:provided?'시간 지정 원문 · 상세 문서 작성 (1회)':'2/2 · 상세 문서 작성',detail:`AI가 ${source.claims.length}개 논점과 ${source.evidence.length}개 시간 근거를 추출했습니다. 근거에 연결된 상세 문서를 작성합니다.`});
   let content:AnalysisContent;
@@ -218,6 +239,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   if(provided) content=includeMissingCaptionTimeline(source,content);
   console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:provided?'user-captions':'video-url',before:timelineBefore,after:content.timeline.length}));
   const audit=assessSourceCoverage(source,content,video.durationSeconds,composed);
+  console.info(JSON.stringify({event:'analysis.time_coverage',requestId,model,depth:'deep',missingWindows:missingEvidenceWindows(source.evidence,video.durationSeconds),sourceCalls}));
   if(composeRecovery)audit.qualityStatus='partial';
   if(audit.sourceIncomplete) content.exclusions.push('시간 근거 분포가 제한적입니다. 영상 후반부의 핵심 발언이 누락되었는지는 원본과 대조해주세요.');
   if(composeRecovery)content.exclusions.push('복구된 아티클은 원본 근거를 사용했으나 요약·타임라인은 1차 근거 메모입니다. 전체 상세 분석으로 확정하지 않았습니다.');
@@ -235,18 +257,20 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
   if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);
   if(depth==='deep' || captionText?.trim())return deepAnalysis(video,model,key,requestId,onProgress,signal,captionText);
   const targets=detailTargets(video.durationSeconds);
-  const detailInstructions=`영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
+  const windows=coverageWindows(video.durationSeconds).map((w,i)=>`${i+1}구간 ${w.label}`).join(' / ');
+  const detailInstructions=`검토해야 할 실제 시간 구간: ${windows}. 후반부를 먼저 확인하되 최종 출력은 시작 시각 순서로 정렬할 것. 각 구간의 실제 발언을 따로 점검하고, 없던 발언을 새로 만들어 항목 수를 채우지 말 것.\n영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
   const attempts=[110000,75000];let lastError:unknown;
   for(let i=0;i<attempts.length;i++){
     if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단됐습니다.',499);
     onProgress({type:'progress',step:2,attempt:i+1,label:i?'일시적 오류 재시도':'기본 영상 분석',detail:'영상에서 근거를 찾고 한국어 결과물을 생성하고 있습니다.'});
     try {
-      const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'text',text:prompt+'\n'+detailInstructions},{type:'video',uri:video.url}],signal,timeoutMs:attempts[i]});
+      const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'video',uri:video.url,...(model==='gemini-3.8-flash'?{processing:'agentic' as const}:{})},{type:'text',text:prompt+'\n'+detailInstructions}],signal,timeoutMs:attempts[i]});
       const result=convert(response.parsed,video,model);
       const timelineBefore=result.original.timeline.length;
-      result.original.timeline=timelineFromEvidenceNotes(result.original.timeline,result.evidence);
+      result.original.timeline=appendUnreferencedEvidenceNotes(timelineFromEvidenceNotes(result.original.timeline,result.evidence),result.evidence);
       console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:'video-url',before:timelineBefore,after:result.original.timeline.length}));
       const audit=assessSinglePassCoverage(result.evidence,result.original,video.durationSeconds);
+      console.info(JSON.stringify({event:'analysis.time_coverage',requestId,model,missingWindows:missingEvidenceWindows(result.evidence,video.durationSeconds),timelineCount:result.original.timeline.length}));
       result.analysisMeta={depth:'standard',providerCalls:i+1,refinement:'not-needed',pipeline:'single-pass',qualityStatus:audit.incomplete?'partial':'review',sourceEndPercent:audit.lastTimelinePercent};
       if(audit.needsReview)result.original.exclusions.push(`타임라인을 원본과 대조해주세요(마지막 근거 구간 종료 시점: 영상의 약 ${audit.lastTimelinePercent}%). 이 값은 영상의 실제 내용 확인률이 아닙니다.`);
       result.edited=structuredClone(result.original);

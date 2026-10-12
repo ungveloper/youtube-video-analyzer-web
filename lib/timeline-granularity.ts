@@ -52,9 +52,13 @@ export function timelineFromSourceClaims(claims: AtomicClaim[], evidence: Eviden
       && item.evidenceIds[0] === refs[0] && meaningful(item.text) && item.text.length <= 340);
     atomic.push({id:`atomic-${index}`, title:'', text:exclusive?.text ?? clean(claim.text), evidenceIds:refs});
   }
-  // If a source map was too coarse, prefer the existing verified timeline rather
-  // than replacing a richer result with fewer lines.
-  return order(preserveTimelineDetail(authored, atomic), evidence);
+  // Keep fully explained authored paragraphs, but append individually evidenced
+  // late facts that the composer failed to cite. Never discard detailed prose.
+  const cited=new Set(authored.flatMap(i=>i.evidenceIds));
+  const additions=atomic.filter(i=>i.evidenceIds.some(id=>!cited.has(id)));
+  const complete=preserveTimelineDetail(authored,atomic);
+  if(complete===atomic)return order(atomic,evidence);
+  return order([...authored,...additions], evidence);
 }
 
 /**
@@ -88,4 +92,18 @@ export function timelineFromEvidenceNotes(authored: GroundedItem[], evidence: Ev
     if (!unique.has(key)) unique.set(key, item);
   });
   return order(preserveTimelineDetail(authored, [...unique.values()]), evidence);
+}
+
+/** Restore evidence notes omitted by a one-call timeline; no new claims or timestamps. */
+export function appendUnreferencedEvidenceNotes(authored:GroundedItem[],evidence:Evidence[]):GroundedItem[]{
+ const cited=new Set(authored.flatMap(item=>item.evidenceIds));
+ const represented=new Set(authored.map(item=>signature(item.text)));
+ const recovered:GroundedItem[]=[];
+ for(const [index,e] of evidence.entries()){
+   const note=clean(e.note||'');
+   if(cited.has(e.id)||!meaningful(note)||represented.has(signature(note)))continue;
+   represented.add(signature(note));
+   recovered.push({id:`evidence-note-${index}`,title:'',text:note,evidenceIds:[e.id]});
+ }
+ return order([...authored,...recovered],evidence);
 }
