@@ -2,10 +2,11 @@
 import type { Evidence, GroundedItem, TranscriptLine } from '@/lib/types';
 import { timestamp } from '@/lib/youtube';
 import { timelineTime } from '@/lib/timeline-granularity';
+import { timelineStartSeconds } from '@/lib/timeline-accuracy';
 
 type Tab = 'summary' | 'timeline' | 'article' | 'transcript';
 export function DetailedAnalysisList({
-  tab, items, evidence, editing, onSeek, onTitleChange, onTextChange,
+  tab, items, evidence, editing, onSeek, onTitleChange, onTextChange, onTimeEdit, timeSource,
 }: {
   tab: Tab;
   items: (GroundedItem | TranscriptLine)[];
@@ -14,13 +15,15 @@ export function DetailedAnalysisList({
   onSeek: (seconds: number) => void;
   onTitleChange: (id: string, title: string) => void;
   onTextChange: (id: string, text: string) => void;
+  onTimeEdit: (id: string, start: number | null) => void;
+  timeSource: 'captions' | 'ai';
 }) {
   const evidenceMap = new Map(evidence.map(item => [item.id, item]));
   const ordered = tab === 'timeline'
     ? [...items].sort((left, right) => {
         const getStart = (item: GroundedItem | TranscriptLine) => {
           if ('startSeconds' in item) return item.startSeconds;
-          return Math.min(...item.evidenceIds.map(id => evidenceMap.get(id)?.startSeconds ?? Number.POSITIVE_INFINITY));
+          return timelineStartSeconds(item, evidence) ?? Number.POSITIVE_INFINITY;
         };
         return getStart(left) - getStart(right);
       })
@@ -33,11 +36,15 @@ export function DetailedAnalysisList({
     {ordered.map(item => {
       const isTranscript = 'startSeconds' in item;
       const refs = isTranscript ? [] : item.evidenceIds.map(id => evidenceMap.get(id)).filter((v): v is Evidence => v !== undefined);
-      const start = isTranscript ? item.startSeconds : refs.length ? Math.min(...refs.map(ref => ref.startSeconds)) : null;
+      const start = isTranscript ? item.startSeconds : timelineStartSeconds(item, evidence);
       const title = isTranscript ? '' : item.title ?? '';
+      const corrected = !isTranscript && item.timeOverrideSeconds !== undefined;
       const more = refs.filter(ref => start !== null && Math.abs(ref.startSeconds-start)>1);
       return <li key={item.id} className="grid grid-cols-[62px_minmax(0,1fr)] gap-3 py-4 first:pt-0 sm:grid-cols-[76px_minmax(0,1fr)] sm:gap-4">
-        <div className="pt-0.5">{start !== null && <button type="button" onClick={() => onSeek(start)} aria-label={`${timelineTime(start)}부터 영상 재생`} title="해당 시간의 영상 재생" className="rounded-md bg-indigo-500/15 px-2 py-1 text-xs font-semibold tabular-nums text-indigo-200 hover:bg-indigo-500/25">{timelineTime(start)}</button>}</div>
+        <div className="space-y-1 pt-0.5">{start !== null && <button type="button" onClick={() => onSeek(start)} aria-label={`${timelineTime(start)}부터 영상 재생`} title={corrected?'사용자가 수정한 시각':timeSource==='captions'?'사용자 제공 자막의 시각':'AI 추정 시각 · 실제 발언 위치는 영상 대조 필요'} className="rounded-md bg-indigo-500/15 px-2 py-1 text-xs font-semibold tabular-nums text-indigo-200 hover:bg-indigo-500/25">{timelineTime(start)}</button>}
+          <span className="block text-[10px] leading-4 text-slate-500">{corrected?'수정 시각':timeSource==='captions'?'자막 시각':'AI 추정 시각'}</span>
+          {editing && !isTranscript && <button type="button" className="text-[11px] text-indigo-300 underline underline-offset-2" onClick={()=>onTimeEdit(item.id,start)}>시각 수정</button>}
+        </div>
         <div className="min-w-0 space-y-2">
           {editing && !isTranscript ? <input aria-label="타임라인 제목 편집" value={title} onChange={event => onTitleChange(item.id,event.target.value)} className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-semibold text-slate-100"/> : title ? <h3 className="text-sm font-semibold leading-6 text-slate-100">{title}</h3> : null}
           {editing ? <textarea aria-label="타임라인 내용 편집" value={item.text} onChange={event=>onTextChange(item.id,event.target.value)} className="min-h-24 w-full rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm leading-7 text-slate-100"/> : <p className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-300">{item.text}</p>}

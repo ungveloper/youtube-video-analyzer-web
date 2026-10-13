@@ -9,7 +9,7 @@ function load(relative){
  const code=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022},reportDiagnostics:true});
  assert.equal(code.diagnostics?.length||0,0,'ts transpile '+relative);
  const exports={};
- Function('exports','require','module',code.outputText)(exports,()=>{throw Error('Unexpected dynamic require')},{exports});
+ Function('exports','require','module',code.outputText)(exports,(id)=>{if(id==='@/lib/timeline-accuracy')return load('lib/timeline-accuracy.ts');throw Error('Unexpected dynamic require: '+id)},{exports});
  return exports;
 }
 const {parseTimedCaptions}=load('lib/caption-input.ts');

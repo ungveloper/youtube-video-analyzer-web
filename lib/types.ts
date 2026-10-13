@@ -1,5 +1,5 @@
 export type Evidence = { id: string; startSeconds: number; endSeconds: number; kind: 'video' | 'audio' | 'caption'; note?: string };
-export type GroundedItem = { id: string; title?: string; text: string; evidenceIds: string[]; edited?: boolean };
+export type GroundedItem = { id: string; title?: string; text: string; evidenceIds: string[]; edited?: boolean; timeOverrideSeconds?: number };
 export type TranscriptLine = { id: string; startSeconds: number; endSeconds: number; text: string; translated: boolean; edited?: boolean };
 export type AnalysisContent = { summary: GroundedItem[]; timeline: GroundedItem[]; article: GroundedItem[]; transcript: TranscriptLine[]; exclusions: string[] };
 export type VideoInfo = { id: string; title: string; channel: string; thumbnail: string; durationSeconds: number; url: string };

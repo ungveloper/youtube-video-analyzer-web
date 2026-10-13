@@ -10,7 +10,7 @@ function loadSource(relative) {
   const output=ts.transpileModule(fs.readFileSync(filename,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022},reportDiagnostics:true});
   assert.equal(output.diagnostics?.length??0,0,relative+' transpile errors');
   const exports={};
-  Function('exports','require','module',output.outputText)(exports,()=>{throw new Error('unexpected runtime require')},{exports});
+  Function('exports','require','module',output.outputText)(exports,(id)=>{if(id==='@/lib/timeline-accuracy')return loadSource('lib/timeline-accuracy.ts');throw new Error('unexpected runtime require: '+id)},{exports});
   return exports;
 }
 const {fallbackFromSource, sourceMapPrompt, composePrompt, extractComposedContent}=loadSource('lib/server/evidence-pipeline.ts');

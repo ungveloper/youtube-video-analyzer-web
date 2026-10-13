@@ -1,5 +1,6 @@
 import type { AnalysisContent } from '@/lib/types';
 import type { SourceMap } from '@/lib/server/evidence-pipeline';
+import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 
 /** Diagnostics reflect source distribution and writing completeness, never medical/factual correctness. */
 export function assessSourceCoverage(source: SourceMap, content: AnalysisContent, duration: number, composed: boolean) {
@@ -39,14 +40,13 @@ export function includeMissingCaptionTimeline(source: SourceMap, content: Analys
 /** One-call URL analysis still needs chronology checks; a completed API response
  * isn't evidence of complete video coverage. This is only a structural audit. */
 export function assessSinglePassCoverage(evidence:SourceMap['evidence'], content:AnalysisContent, duration:number){
-  const used=new Set(content.timeline.flatMap(x=>x.evidenceIds));
-  const referenced=evidence.filter(e=>used.has(e.id));
-  const buckets=new Set(referenced.map(e=>Math.min(3,Math.floor(e.startSeconds / duration * 4))));
-  const latestEnd=Math.max(0,...referenced.map(e=>e.endSeconds));
-  const lastTimelinePercent=duration?Math.min(100,Math.round(latestEnd/duration*100)):0;
-  const expectedTimeline=duration<=300?9:duration<=900?12:16;
-  const needsReview=content.timeline.length<expectedTimeline || buckets.size<4 || lastTimelinePercent<85;
-  // Only an actual severe tail gap warrants the 'partial' badge.
-  const incomplete=lastTimelinePercent<60;
-  return {incomplete,needsReview,lastTimelinePercent,buckets:buckets.size,timelineCount:content.timeline.length};
+  const timeline = assessTimelineTiming(content.timeline,evidence,duration);
+  const used = new Set(content.timeline.flatMap(item => item.evidenceIds));
+  const referenced = evidence.filter(e => used.has(e.id));
+  const buckets = new Set(referenced.map(e => Math.min(3,Math.floor(e.startSeconds / duration * 4))));
+  const lastTimelinePercent = duration && timeline.lastEndSeconds !== null ? Math.min(100,Math.round(timeline.lastEndSeconds/duration*100)) : 0;
+  const expectedTimeline = duration<=300?9:duration<=900?12:16;
+  const needsReview = content.timeline.length<expectedTimeline || buckets.size<4 || timeline.hasSparseEnding || timeline.gaps.length>0;
+  const incomplete = lastTimelinePercent < 60;
+  return {incomplete,needsReview,lastTimelinePercent,buckets:buckets.size,timelineCount:content.timeline.length,timing:timeline};
 }

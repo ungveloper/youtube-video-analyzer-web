@@ -67,5 +67,5 @@ const exportModule=fs.readFileSync(path.join(root,'lib/exporters.ts'),'utf8');
 assert.match(server,/timelineFromSourceClaims\(source\.claims,source\.evidence/);
 assert.match(server,/timelineFromEvidenceNotes\(result\.original\.timeline,result\.evidence\)/);
 assert.match(ui,/aria-label="발언별 타임라인"/);
-assert.match(exportModule,/timelineSection\(c\.timeline,record\.evidence\)/);
+assert.match(exportModule,/timelineSection\(c\.timeline,record\.evidence,/);
 console.log('PASS: verified MM:SS / per-claim timeline / per-evidence split / no invented times / UI and export integration');

@@ -11,6 +11,7 @@ import { assessSourceCoverage, assessSinglePassCoverage, includeMissingCaptionTi
 import { timelineFromSourceClaims, timelineFromEvidenceNotes, appendUnreferencedEvidenceNotes } from '@/lib/timeline-granularity';
 import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/temporal-coverage';
 import {resolveVideoProcessing, type VideoProcessingMode, type VideoProcessingPreference} from '@/lib/video-processing';
+import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -246,9 +247,11 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   if(provided) content=includeMissingCaptionTimeline(source,content);
   console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:provided?'user-captions':'video-url',before:timelineBefore,after:content.timeline.length}));
   const audit=assessSourceCoverage(source,content,video.durationSeconds,composed);
+  const timing=assessTimelineTiming(content.timeline,source.evidence,video.durationSeconds);
+  console.info(JSON.stringify({event:'analysis.timeline_time_review',requestId,sourceMode:provided?'user-captions':'video-url',gaps:timing.gaps,lastStartSeconds:timing.lastStartSeconds,lastEndSeconds:timing.lastEndSeconds,aiTimesUnverified:!provided}));
   console.info(JSON.stringify({event:'analysis.time_coverage',requestId,model,depth:'deep',missingWindows:missingEvidenceWindows(source.evidence,video.durationSeconds),sourceCalls}));
   if(composeRecovery)audit.qualityStatus='partial';
-  if(audit.sourceIncomplete) content.exclusions.push('시간 근거 분포가 제한적입니다. 영상 후반부의 핵심 발언이 누락되었는지는 원본과 대조해주세요.');
+  // Sparse time coverage is a review warning in the timeline UI, not an excluded fact.
   if(composeRecovery)content.exclusions.push('복구된 아티클은 원본 근거를 사용했으나 요약·타임라인은 1차 근거 메모입니다. 전체 상세 분석으로 확정하지 않았습니다.');
   if(audit.articleIncomplete) content.exclusions.push(composed?'아티클이 상세도 기준에 미치지 못합니다. 근거만으로 충분한 설명을 생성하지 못했습니다.':'2차 아티클 생성 실패: 아티클은 제공하지 않고 1차 근거 메모만 보여줍니다.');
   if(audit.qualityStatus==='partial') content.exclusions.push('부분 분석으로 분류했습니다. 실제 영상과 대조하여 누락된 내용을 확인하세요.');
@@ -282,8 +285,10 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:'video-url',before:timelineBefore,after:result.original.timeline.length}));
       const audit=assessSinglePassCoverage(result.evidence,result.original,video.durationSeconds);
       console.info(JSON.stringify({event:'analysis.time_coverage',requestId,model,missingWindows:missingEvidenceWindows(result.evidence,video.durationSeconds),timelineCount:result.original.timeline.length}));
+      console.info(JSON.stringify({event:'analysis.timeline_time_review',requestId,sourceMode:'video-url',gaps:audit.timing.gaps,lastStartSeconds:audit.timing.lastStartSeconds,lastEndSeconds:audit.timing.lastEndSeconds,aiTimesUnverified:true}));
       result.analysisMeta={depth:'standard',videoProcessing,elapsedMs:Date.now()-analysisStarted,inputTokens:response.tokens.input??undefined,outputTokens:response.tokens.output??undefined,providerCalls:i+1,refinement:'not-needed',pipeline:'single-pass',qualityStatus:audit.incomplete?'partial':'review',sourceEndPercent:audit.lastTimelinePercent};
-      if(audit.needsReview)result.original.exclusions.push(`타임라인을 원본과 대조해주세요(마지막 근거 구간 종료 시점: 영상의 약 ${audit.lastTimelinePercent}%). 이 값은 영상의 실제 내용 확인률이 아닙니다.`);
+      // Time review belongs in the timeline UI, not the list of excluded facts.
+      // A provider-derived timecode cannot be certified against speech without captions.
       result.edited=structuredClone(result.original);
       onProgress({type:'progress',step:4,label:'타임라인 전체 구간 검사',detail:audit.needsReview?'세부 발언의 시간 근거를 원본과 대조해주세요.':'타임라인 시간 분포와 근거 구조를 확인했습니다.'});
       const quality=assessDetail(result.original,video.durationSeconds);

@@ -2,26 +2,28 @@
 import type { AnalysisRecord, AnalysisContent,GroundedItem,TranscriptLine } from '@/lib/types';
 import { timestamp } from '@/lib/youtube';
 import { timelineTime } from '@/lib/timeline-granularity';
+import {timelineStartSeconds} from '@/lib/timeline-accuracy';
 function section(name:string, items:GroundedItem[], evidence:AnalysisRecord['evidence']){
   return `## ${name}\n\n`+items.map(i=>{
     const sources=i.evidenceIds.map(id=>evidence.find(e=>e.id===id)).filter((e):e is NonNullable<typeof e>=>Boolean(e));
     return `${i.title?`### ${i.title}\n\n`:''}${i.text}\n\n${sources.length?`영상 근거: ${sources.map(e=>`${timestamp(e.startSeconds)}–${timestamp(e.endSeconds)}`).join(', ')}\n`:''}${i.edited?'(사용자 편집본 · 원본 대조 필요)\n':''}`;
   }).join('\n');
 }
-function timelineSection(items:GroundedItem[], evidence:AnalysisRecord['evidence']) {
+function timelineSection(items:GroundedItem[], evidence:AnalysisRecord['evidence'], captionSource:boolean) {
   const lookup = new Map(evidence.map(item=>[item.id,item]));
   const entries = items.map(item=>{
     const refs=item.evidenceIds.map(id=>lookup.get(id)).filter((e):e is NonNullable<typeof e>=>Boolean(e));
-    const start=refs.length?Math.min(...refs.map(e=>e.startSeconds)):null;
+    const start=timelineStartSeconds(item,evidence);
     return {item,refs,start};
   }).sort((a,b)=>(a.start??Infinity)-(b.start??Infinity));
-  return '## 타임라인\n\n'+entries.map(({item,refs,start})=>{
+  return `## 타임라인\n\n> ${captionSource?'사용자가 제공한 시간 지정 자막의 구간 시작 시각입니다. 자막 자체의 정확성은 원본과 비교하세요.':'AI 추정 시각: 실제 발화와 몇 초 단위로 일치하는지는 검증되지 않았습니다. 수정된 항목은 사용자 지정 시각입니다.'}\n\n`+entries.map(({item,refs,start})=>{
     const heading=start===null?'시간 미확인':timelineTime(start);
+    const timeLabel=item.timeOverrideSeconds!==undefined?' (사용자 수정 시각)':'';
     const more=refs.filter(e=>start!==null && Math.abs(e.startSeconds-start)>1);
-    return `**${heading}** ${item.title?`**${item.title}** — `:''}${item.text}${more.length?`\n\n추가 근거: ${more.map(e=>timelineTime(e.startSeconds)).join(', ')}`:''}${item.edited?'\n\n(사용자 편집본 · 원본 대조 필요)':''}`;
+    return `**${heading}${timeLabel}** ${item.title?`**${item.title}** — `:''}${item.text}${more.length?`\n\n추가 근거: ${more.map(e=>timelineTime(e.startSeconds)).join(', ')}`:''}${item.edited?'\n\n(사용자 편집본 · 원본 대조 필요)':''}`;
   }).join('\n\n')+'\n\n';
 }
-export function toMarkdown(record:AnalysisRecord){const c=record.edited;return `# ${record.video.title}\n\n원본 영상: ${record.video.url}\n채널: ${record.video.channel}\n분석일: ${new Date(record.createdAt).toLocaleString('ko-KR')}\nAI 모델: ${record.model}\n\n> AI 생성 정보는 반드시 원본과 대조하세요. 사용자 편집본은 원본 발언을 보증하지 않습니다.\n\n${section('핵심 요약',c.summary,record.evidence)}\n${timelineSection(c.timeline,record.evidence)}\n${section('상세 아티클',c.article,record.evidence)}\n## 스크립트\n\n${c.transcript.length?c.transcript.map(t=>`[${timestamp(t.startSeconds)}] ${t.text}${t.translated?' (번역)':''}${t.edited?' (사용자 편집)':''}`).join('\n\n'):'원문 전사를 확보하지 못해 스크립트를 제공하지 않습니다.'}\n\n## 확인되지 않아 제외한 내용\n\n${c.exclusions.length?c.exclusions.map(v=>'- '+v).join('\n'):'특별히 기록된 항목 없음'}\n`;}
+export function toMarkdown(record:AnalysisRecord){const c=record.edited;return `# ${record.video.title}\n\n원본 영상: ${record.video.url}\n채널: ${record.video.channel}\n분석일: ${new Date(record.createdAt).toLocaleString('ko-KR')}\nAI 모델: ${record.model}\n\n> AI 생성 정보는 반드시 원본과 대조하세요. 사용자 편집본은 원본 발언을 보증하지 않습니다.\n\n${section('핵심 요약',c.summary,record.evidence)}\n${timelineSection(c.timeline,record.evidence,record.analysisMeta?.sourceMode==='user-captions')}\n${section('상세 아티클',c.article,record.evidence)}\n## 스크립트\n\n${c.transcript.length?c.transcript.map(t=>`[${timestamp(t.startSeconds)}] ${t.text}${t.translated?' (번역)':''}${t.edited?' (사용자 편집)':''}`).join('\n\n'):'원문 전사를 확보하지 못해 스크립트를 제공하지 않습니다.'}\n\n## 확인되지 않아 제외한 내용\n\n${c.exclusions.length?c.exclusions.map(v=>'- '+v).join('\n'):'특별히 기록된 항목 없음'}\n`;}
 export function toPlainText(record:AnalysisRecord){return toMarkdown(record).replace(/^#{1,3}\s*/gm,'').replace(/^>\s?/gm,'').replace(/\*\*/g,'');}
 function downloadBlob(blob:Blob,name:string){const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),4000)}
 function safeName(s:string){return s.replace(/[\\/:*?"<>|\x00-\x1f]/g,'_').slice(0,70)||'youtube-analysis'}
