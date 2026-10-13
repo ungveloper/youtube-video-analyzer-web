@@ -53,12 +53,16 @@ export function assessTimelineTiming(items: GroundedItem[], evidence: Evidence[]
     if (to - from > threshold) gaps.push({from,to,seconds:to-from});
   }
   const last = points.at(-1);
+  const lastEnd = points.length? Math.max(...points.map(point=>point.end)):null;
+  // A row at 02:48 could describe speech ending at 03:18. Judge the
+  // closing gap by available END anchors, never by the final START alone.
+  const endingGapThreshold=Math.max(12,Math.min(35,durationSeconds*0.1));
   return {
     firstSeconds: distinctStarts[0] ?? null,
     lastStartSeconds: last?.start ?? null,
-    lastEndSeconds: last?.end ?? null,
+    lastEndSeconds: lastEnd,
     gaps,
     // A missing final start is a review hint; no claim about percentage of speech heard.
-    hasSparseEnding: durationSeconds > 0 && (!last || last.start < durationSeconds * 0.85),
+    hasSparseEnding: durationSeconds > 0 && (lastEnd===null || durationSeconds-lastEnd > endingGapThreshold),
   };
 }

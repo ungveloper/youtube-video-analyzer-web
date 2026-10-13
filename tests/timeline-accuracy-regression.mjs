@@ -31,6 +31,8 @@ assert.equal(parseTimelineTime('-1:23',202),null);
 const fixed={...items[10],timeOverrideSeconds:64};
 assert.equal(timelineStartSeconds(fixed,evidence),64);
 assert.equal(assessTimelineTiming([...items.slice(0,10),fixed,...items.slice(11)],evidence,202).gaps.length,1,'manual edit must not generate synthetic adjacent timecodes');
+const startsEarlyEndsLate=[...evidence.slice(0,-1),{...evidence.at(-1),endSeconds:198}];
+assert.equal(assessTimelineTiming(items,startsEarlyEndsLate,202).hasSparseEnding,false,'a final spoken sentence may start early but end near the video end');
 const captions=evidence.map(e=>({...e,kind:'caption'}));
 assert.equal(assessTimelineTiming(items,captions,202).lastStartSeconds,154,'caption timing stays unchanged');
 const ui=fs.readFileSync(path.join(root,'components/detailed-analysis-list.tsx'),'utf8');

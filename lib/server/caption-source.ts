@@ -1,5 +1,5 @@
 /** Uses ONLY a user's supplied time-coded subtitles; no third-party caption retrieval. */
-import type { VideoInfo } from '@/lib/types';
+import type { GroundedItem, VideoInfo } from '@/lib/types';
 import type { SourceMap, SourceClaim } from '@/lib/server/evidence-pipeline';
 import { parseTimedCaptions } from '@/lib/caption-input';
 
@@ -66,4 +66,14 @@ export function captionClaimPrompt(source:SourceMap):string {
 각 자막 구간의 실제 말한 내용을 빠뜨리지 말고, 논점·설명·사례·숫자·조건·전환을 하나의 구체적 주장씩 claims 배열로 분해하라. 명확한 발언만 다루고 발표자의 주장이라는 표현을 유지한다. 각 claim의 evidenceIds는 아래 원본 evidence ID에서 선택하며 없는 ID를 만들면 안 된다. 일괄 요약하거나 중복 문장으로 개수를 채우지 마라.\n
 JSON 객체를 반환하라. 필수로 claims 배열을 사용하며, evidence/transcript/exclusions는 빈 배열을 보내도 된다. 서버는 자막의 진짜 시간 근거를 별도로 보존한다.\n
 ${JSON.stringify(source.evidence).slice(0,95000)}`;
+}
+
+/** A user-supplied timed transcript is the authoritative text for its own timeline.
+ * Editorial Gemini output may rewrite summary/article, but cannot replace these
+ * already supplied utterances with paraphrases or invent additional stamps. */
+export function timelineFromProvidedCaptions(source:SourceMap):GroundedItem[] {
+  return source.evidence
+    .filter(e=>e.kind==='caption' && Boolean(e.note?.trim()))
+    .sort((a,b)=>a.startSeconds-b.startSeconds)
+    .map((e,i)=>({id:`verbatim-caption-${i}`,title:'',text:(e.note || '').trim(),evidenceIds:[e.id]}));
 }

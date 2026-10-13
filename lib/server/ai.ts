@@ -6,8 +6,8 @@ import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
 import { assessDetail, detailTargets } from '@/lib/analysis-detail';
 import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource, focusedTailPrompt, mergeFocusedTail } from '@/lib/server/evidence-pipeline';
-import { sourceFromUserCaptions } from '@/lib/server/caption-source';
-import { assessSourceCoverage, assessSinglePassCoverage, includeMissingCaptionTimeline } from '@/lib/quality-audit';
+import { sourceFromUserCaptions, timelineFromProvidedCaptions } from '@/lib/server/caption-source';
+import { assessSourceCoverage, assessSinglePassCoverage } from '@/lib/quality-audit';
 import { timelineFromSourceClaims, timelineFromEvidenceNotes, appendUnreferencedEvidenceNotes } from '@/lib/timeline-granularity';
 import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/temporal-coverage';
 import {resolveVideoProcessing, type VideoProcessingMode, type VideoProcessingPreference} from '@/lib/video-processing';
@@ -19,8 +19,8 @@ const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한
 
 작업 규칙:
 1. **먼저 영상 후반 50~100%를 살펴 새로운 발언·비교·예시·결론을 기록한 다음**, 처음으로 돌아와 0~25%,25~50%,50~75%,75~100% 전 구간을 순서대로 정리한다. 특히 영상 끝부분까지 논점이 바뀌는지 확인한다. 초반 개념에 출력 토큰을 소진하지 않는다.
-2. **타임라인은 문장/의미 전환마다 하나씩** 만든다. 한 문단에 정의·비유·원인·사례·증상·구별법을 합치지 않는다. 3~5분 정보 중심 영상은 충분한 발언이 실제 있으면 약 10~16개를 목표로 한다. 시간 근거 하나당 확인 가능한 핵심 발언 한 개만 1~2문장으로 기록한다. 시점을 임의로 배분하지 않고 각 항목의 evidenceIds에 실제 그 발언이 시작한 근거를 연결한다. 00:33과 00:49에 서로 다른 발언이 있으면 두 개 항목으로 나눈다. 확인할 수 있는 근거가 없으면 숫자를 맞추려고 채우지 않는다.
-2-1. evidence[]는 가능한 한 발언 하나당 하나의 좁은 실제 구간을 만들고 note에는 **그 구간에 해당하는 구체적인 발언 내용**을 1문장으로 적는다. 여러 다른 시점을 하나의 evidence에 합치지 않는다. 이를 확인할 수 없으면 세부 시간을 추측하지 말고 원래 확인된 넓은 구간을 사용한다.
+2. **타임라인은 음성 발언의 어순·말투를 최대한 유지하는 발언 중심 기록**이다. 요약·해설·의학적 보충설명·새로운 단정문을 만들지 않는다. 실제로 들은 표현만 사용하되, 정확한 원문이라고 보증할 수 없으므로 발언 시각과 내용은 모두 검증 전 초안으로 취급한다. **문장/의미 전환마다 하나씩** 만든다. 한 문단에 정의·비유·원인·사례·증상·구별법을 합치지 않는다. 3~5분 정보 중심 영상은 충분한 발언이 실제 있으면 약 10~16개를 목표로 한다. 시간 근거 하나당 확인 가능한 핵심 발언 한 개만 1~2문장으로 기록한다. 시점을 임의로 배분하지 않고 각 항목의 evidenceIds에 실제 그 발언이 시작한 근거를 연결한다. 00:33과 00:49에 서로 다른 발언이 있으면 두 개 항목으로 나눈다. 확인할 수 있는 근거가 없으면 숫자를 맞추려고 채우지 않는다.
+2-1. evidence[]는 가능한 한 발언 하나당 하나의 좁은 실제 구간을 만들고 note에는 **그 구간에서 들은 발언의 실제 어순과 말투에 가까운 문장**을 적는다. "설명한다", "강조한다", "사례를 제시한다" 같은 편집자 요약문을 피한다. 들리지 않는 어휘는 채우거나 의학 지식으로 보완하지 않는다. 여러 다른 시점을 하나의 evidence에 합치지 않는다. 이를 확인할 수 없으면 세부 시간을 추측하지 말고 원래 확인된 넓은 구간을 사용한다.
 3. summary는 타임라인의 세부 논점을 논리별로 묶은 **서로 다른 요점 3~6개**로 구성한다. 각 요점은 고유한 주장 + 영상의 이유 또는 구체적인 사례를 2~3문장으로 쓴다.
 4. article은 한 줄씩 복사한 항목집이 아니라 영상 원문을 토대로 이어지는 **설명형 완성 아티클**이다. 실제 확인한 (a) 정의·비유 (b) 원인 및 다른 가능성 (c) 사례 (d) 증상과 혼동하기 쉬운 내용의 차이 (e) 화자의 결론 중 영상에 나온 소재만 사용해 3~6개의 의미 있는 소제목으로 나눈다. 항목별 본문은 실제 정보가 있으면 여러 개의 자연스러운 문단으로 쓰고 같은 문장을 반복하지 않는다.
 5. 모든 summary·timeline·article 항목에 evidenceIds를 연결한다. 존재하는 영상의 실제 발언 시간만 적고 없거나 불확실한 시간·수치·주장을 만들지 않는다. 발표자의 의학적·통계적 주장과 별도로 검증된 과학적 사실을 구분한다.
@@ -69,9 +69,9 @@ const analysisFormat = {
             schema: {
               type: 'object',
               properties: {
-                evidence: { type: 'array', description: '서로 다른 발언마다 실제 확인한 좁은 시간 구간과 구체적인 근거 노트를 기록. 모르는 시각은 추측 금지.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind','note'] } },
+                evidence: { type: 'array', description: '영상 속 발언의 어순과 표현을 최대한 유지한 노트. 편집자의 요약/단정/의학 설명으로 바꿔 쓰지 말 것. 불명확한 시각은 추측 금지.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, kind: {type: 'string'}, note: {type: 'string'}}, required: ['id','startSeconds','endSeconds','kind','note'] } },
                 summary: { type: 'array', description: '핵심 주장별 분리된 상세 요약 목록. 각 text는 여러 문장.', items: { type: 'object', properties: {id: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','text','evidenceIds'] } },
-                timeline: { type: 'array', description: '실제 발언의 의미가 바뀌는 시점마다 한 항목. 하나의 사실/발언만 1~2문장, 개별 근거시간 연결. 서로 다른 시점을 하나로 묶지 말 것.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
+                timeline: { type: 'array', description: '화자가 실제로 말한 표현에 가까운 1~2문장을 시간순으로. 요약형 제목이나 새 사실 추가 금지. 의미 전환마다 한 항목.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
                 article: { type: 'array', description: '긴 호흡의 해설 문서: 소제목별 여러 문단을 개행 두 번으로 구분.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
                 transcript: { type: 'array', description: '실제 원문 발화를 확인한 경우에만 작성. 확인 불가시 빈 배열.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
                 exclusions: {type: 'array', items: {type: 'string'}},
@@ -243,8 +243,11 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   // Restore atomic time-aligned claims when a composed timeline merged multiple
   // source moments into a single paragraph; no additional Gemini request.
   const timelineBefore = content.timeline.length;
-  content = {...content, timeline: timelineFromSourceClaims(source.claims,source.evidence,content.timeline)};
-  if(provided) content=includeMissingCaptionTimeline(source,content);
+  // Timed captions are the one source whose wording and time anchors we have.
+  // Gemini may summarize them in the article but must not rewrite the timeline.
+  content = {...content, timeline: provided
+    ? timelineFromProvidedCaptions(source)
+    : timelineFromSourceClaims(source.claims,source.evidence,content.timeline)};
   console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:provided?'user-captions':'video-url',before:timelineBefore,after:content.timeline.length}));
   const audit=assessSourceCoverage(source,content,video.durationSeconds,composed);
   const timing=assessTimelineTiming(content.timeline,source.evidence,video.durationSeconds);
@@ -270,7 +273,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
   const analysisStarted=Date.now();
   const targets=detailTargets(video.durationSeconds);
   const windows=coverageWindows(video.durationSeconds).map((w,i)=>`${i+1}구간 ${w.label}`).join(' / ');
-  const detailInstructions=`검토해야 할 실제 시간 구간: ${windows}. 후반부를 먼저 확인하되 최종 출력은 시작 시각 순서로 정렬할 것. 각 구간의 실제 발언을 따로 점검하고, 없던 발언을 새로 만들어 항목 수를 채우지 말 것.\n영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
+  const detailInstructions=`타임라인의 text는 제삼자 설명문이 아니라 화자의 발언처럼 자연스럽고 원문 어순에 충실하게 작성한다. '설명함/소개함/권장함' 같은 메모체와 영상에 없는 의학적 보강을 하지 않는다. 예를 들어 화자가 '하지만 이 질병의 80%가 다리에서 시작됩니다'라고 했다면 '뇌경색 위험의 80%가 다리 질환과 연관'처럼 대상을 바꾸지 않는다. 정확하게 들리지 않으면 제외한다. 이 입력은 검증된 전사 원문이 아니므로 그대로 들었다고 확신하거나 인증하지 않는다.\n검토해야 할 실제 시간 구간: ${windows}. 후반부를 먼저 확인하되 최종 출력은 시작 시각 순서로 정렬할 것. 각 구간의 실제 발언을 따로 점검하고, 없던 발언을 새로 만들어 항목 수를 채우지 말 것.\n영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
   // Fast/basic mode: no silent second video pass after a 503/timeout.
   // The user can retry deliberately; deep mode retains its recovery policy.
   const attempts=[video.durationSeconds<300?90000:120000];let lastError:unknown;

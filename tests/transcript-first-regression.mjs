@@ -16,7 +16,7 @@ const {parseTimedCaptions}=load('lib/caption-input.ts');
 const pasted=parseTimedCaptions('0:00\n첫 부분의 실제 발화\n0:33 다음 정보와 사례\n0:53\n다른 위험 요인\n1:44\n걷는 동안 발생하는 증상과 쉬면 호전되는 설명\n2:08\n다른 질환과의 구별\n2:44\n결론과 주의사항',202);
 assert.equal(pasted.length,6);
 assert.deepEqual(pasted.map(x=>x.startSeconds),[0,33,53,104,128,164]);
-assert.equal(pasted.at(-1).endSeconds,202);
+assert.equal(pasted.at(-1).endSeconds,164,'last pasted timestamp is a START marker, not proof of speech through 202s');
 const inline=parseTimedCaptions('0:00 시작\n0:12 중간\n0:44 마무리',62);
 assert.equal(inline.length,3);
 const srt=parseTimedCaptions('1\n00:00:01,000 --> 00:00:04,000\n안녕하세요\n\n2\n00:00:07,000 --> 00:00:11,000\n두 번째 구간',62);

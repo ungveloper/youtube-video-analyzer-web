@@ -24,7 +24,7 @@ export function parsePastedTranscript(input:string,videoDurationSeconds:number):
   const chunks:Array<{startSeconds:number;text:string[]}>=[];
   for(const line of lines){
     if(!line || /^\[(?:music|applause|음악|박수)\]$/i.test(line))continue;
-    const match=line.match(/^(\d{1,3}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)(?:\s+(.+))?$/);
+    const match=line.match(/^\[?(\d{1,3}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)\]?(?:\s+(.+))?$/);
     const start=match?stamp(match[1]):null;
     if(start!==null && start>=0 && start<videoDurationSeconds){
       chunks.push({startSeconds:start,text:match?.[2]?[match[2]]:[]});
@@ -34,9 +34,11 @@ export function parsePastedTranscript(input:string,videoDurationSeconds:number):
   const result:CaptionCue[]=[];
   for(let i=0;i<chunks.length;i++){
     const item=chunks[i],next=chunks[i+1];
-    const end=Math.min(videoDurationSeconds,next?.startSeconds??videoDurationSeconds);
+    // A copied transcript contains start stamps only. Do not pretend the final
+    // utterance runs to the end of the video when no ending stamp exists.
+    const end=next?Math.min(videoDurationSeconds,next.startSeconds):item.startSeconds;
     const text=cleanText(item.text.join(' '));
-    if(text && end>item.startSeconds && end-item.startSeconds<=120)
+    if(text && end>=item.startSeconds && end-item.startSeconds<=120)
       result.push({startSeconds:item.startSeconds,endSeconds:end,text});
   }
   return result;
