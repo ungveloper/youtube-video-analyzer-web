@@ -13,10 +13,11 @@ import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/tempo
 import {resolveVideoProcessing, type VideoProcessingMode, type VideoProcessingPreference} from '@/lib/video-processing';
 import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS } from '@/lib/provider-retry';
+import {speechReviewWindows, speechFirstTimeline, mergeSupplementalSpeech} from '@/lib/speech-timeline';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
-우선순위: **시청자가 영상을 보지 않아도 모든 논점과 비교·사례·경고를 이해하도록 빠짐없이 기록**한다. 길게 쓰는 척하기 위해 영상에 없는 내용은 추가하지 않는다.
+우선순위: **원문의 발언을 생략하지 않고 시간순으로 기록한 다음, 그 발언에서 요약과 아티클을 작성**한다. 길게 쓰는 척하기 위해 영상에 없는 내용은 추가하지 않는다.
 
 작업 규칙:
 1. **먼저 영상 후반 50~100%를 살펴 새로운 발언·비교·예시·결론을 기록한 다음**, 처음으로 돌아와 0~25%,25~50%,50~75%,75~100% 전 구간을 순서대로 정리한다. 특히 영상 끝부분까지 논점이 바뀌는지 확인한다. 초반 개념에 출력 토큰을 소진하지 않는다.
@@ -25,7 +26,7 @@ const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한
 3. summary는 타임라인의 세부 논점을 논리별로 묶은 **서로 다른 요점 3~6개**로 구성한다. 각 요점은 고유한 주장 + 영상의 이유 또는 구체적인 사례를 2~3문장으로 쓴다.
 4. article은 한 줄씩 복사한 항목집이 아니라 영상 원문을 토대로 이어지는 **설명형 완성 아티클**이다. 실제 확인한 (a) 정의·비유 (b) 원인 및 다른 가능성 (c) 사례 (d) 증상과 혼동하기 쉬운 내용의 차이 (e) 화자의 결론 중 영상에 나온 소재만 사용해 3~6개의 의미 있는 소제목으로 나눈다. 항목별 본문은 실제 정보가 있으면 여러 개의 자연스러운 문단으로 쓰고 같은 문장을 반복하지 않는다.
 5. 모든 summary·timeline·article 항목에 evidenceIds를 연결한다. 존재하는 영상의 실제 발언 시간만 적고 없거나 불확실한 시간·수치·주장을 만들지 않는다. 발표자의 의학적·통계적 주장과 별도로 검증된 과학적 사실을 구분한다.
-6. transcript는 발언을 정확하게 전사했다고 확신할 때만 제공한다. 원문 확인이 불가능하면 []이고 생성한 해설을 발화문으로 둔갑시키지 않는다.
+6. transcript는 이번 분석의 **최우선 산출물**이다. 실제 음성으로 들리는 한국어 발화 문장들을 가능한 한 그대로, 해당 발언이 시작되는 초와 끝나는 초를 연결해 기록한다. 3~5분 대화형 영상에서는 발언이 확인되면 15~40개의 문장·의미 전환을 가능한 한 유지하며, 특히 종료 1분의 발언도 먼저 확인한다. 00~25%,25~50%,50~75%,75~100%에 실제 발언이 있으면 모두 기록한다. transcript[].text는 요약·해설체("소개합니다", "강조합니다")가 아니라 화자가 말한 어휘·어순에 가까운 문장이다. 음성을 듣지 못한 구간을 만들거나 발언 시각을 균등 분할하여 지어내지 마라. 완전한 축자 녹취를 보장할 수 없으면 exclusions에서 명확히 밝혀라. transcript=[]는 유효한 발화를 전혀 확인하지 못한 경우에만 사용한다.
 7. 타임라인은 영상의 4개 구간을 독립적으로 검토하고, 구간마다 실제 발언된 새 정보가 있다면 반드시 기록한다. 마지막 구간의 발언을 확인할 수 없다면 exclusions에 남기고 시간을 지어내지 않는다.
 8. 출력은 제공된 JSON Schema를 지키는 한국어 JSON 한 개. 문서가 너무 짧아질 것 같으면 근거가 있는 타임라인 논점과 증상/차이점/결론의 누락을 우선 방지한다.
 `;
@@ -74,13 +75,21 @@ const analysisFormat = {
                 summary: { type: 'array', description: '핵심 주장별 분리된 상세 요약 목록. 각 text는 여러 문장.', items: { type: 'object', properties: {id: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','text','evidenceIds'] } },
                 timeline: { type: 'array', description: '화자가 실제로 말한 표현에 가까운 1~2문장을 시간순으로. 요약형 제목이나 새 사실 추가 금지. 의미 전환마다 한 항목.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
                 article: { type: 'array', description: '긴 호흡의 해설 문서: 소제목별 여러 문단을 개행 두 번으로 구분.', items: { type: 'object', properties: {id: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}, evidenceIds: {type: 'array',items: {type: 'string'}}}, required: ['id','title','text','evidenceIds'] } },
-                transcript: { type: 'array', description: '실제 원문 발화를 확인한 경우에만 작성. 확인 불가시 빈 배열.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
+                transcript: { type: 'array', description: '최우선 출력: 실제 들리는 발화에 가까운 문장과 시작/끝의 시각, 3~5분 영상에서 가능한 경우 15~40개. 초중후반과 마지막 발언까지; 요약문 금지. 확신할 수 없으면 추측 금지.', items: { type: 'object', properties: {id: {type: 'string'}, startSeconds: {type: 'number'}, endSeconds: {type: 'number'}, text: {type: 'string'}, translated: {type: 'boolean'}}, required: ['id','startSeconds','endSeconds','text','translated'] } },
                 exclusions: {type: 'array', items: {type: 'string'}},
               }, required: ['evidence','summary','timeline','article','transcript','exclusions'],
             },
           };
 
 
+const speechTailFormat={type:'text',mime_type:'application/json',schema:{type:'object',properties:{lines:{type:'array',items:{type:'object',properties:{startSeconds:{type:'number'},endSeconds:{type:'number'},text:{type:'string'}},required:['startSeconds','endSeconds','text']}}},required:['lines']}};
+function focusedSpeechPrompt(duration:number,windows:Array<{from:number;to:number}>):string{
+  const clock=(time:number)=>`${String(Math.floor(time/60)).padStart(2,'0')}:${String(Math.floor(time%60)).padStart(2,'0')}`;
+  return `이 요청은 기존 영상 분석에서 누락된 **음성 발화만 회복**하기 위한 것이다. 같은 영상 전체를 다시 요약하지 말라.
+영상 전체 길이 ${clock(duration)}. 다음 시간 구간에 실제 들리는 문장만 한 발언마다 lines 요소 하나로 기록한다:
+${windows.map(w=>`- ${clock(w.from)}~${clock(w.to)}`).join('\n')}
+각 lines[].text는 실제 음성의 어휘와 문장에 최대한 가까워야 한다. 제삼자 설명/주제 요약/질병 상식 추가/오디오 미확인 부분 보충/균등 시간 배분을 금지한다. 발언이 없는 구간은 빈 배열로 두고, 반드시 원래 영상의 실제 절대 시작·종료 초를 적는다. 이번 응답은 lines JSON만 작성하라.`;
+}
 const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
@@ -270,7 +279,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+compositionCalls,sourceCalls,compositionCalls,composeRecovery:composeRecovery??null,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,sourceBuckets:audit.sourceBuckets,articleChars:audit.articleChars,sourceIncomplete:audit.sourceIncomplete,articleIncomplete:audit.articleIncomplete,composeFailureCode:composeFailureCode??null}));
   return result;
 }
-export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true):Promise<AnalysisRecord>{
+export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true,recoverMissingSpeech=true):Promise<AnalysisRecord>{
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);
   const videoProcessing=resolveVideoProcessing(video.durationSeconds,model,processingPreference);
@@ -289,18 +298,51 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'video',uri:video.url,processing:videoProcessing},{type:'text',text:prompt+'\n'+detailInstructions}],signal,timeoutMs:attempts[i],thinkingLevel:'low',maxOutputTokens:video.durationSeconds<300?12000:16000});
       const result=convert(response.parsed,video,model);
       const timelineBefore=result.original.timeline.length;
-      result.original.timeline=appendUnreferencedEvidenceNotes(timelineFromEvidenceNotes(result.original.timeline,result.evidence),result.evidence);
-      console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:'video-url',before:timelineBefore,after:result.original.timeline.length}));
+      let supplementalCalls=0;
+      let supplementalAdded=0;
+      // Speech-first: a model-provided utterance must NOT be overwritten by its separate
+      // editorial summary. It is still an UNVERIFIED audio interpretation, not captions.
+      let speech=speechFirstTimeline(result.original.transcript,result.evidence,video.durationSeconds);
+      const initialGaps=speech.timeline.length
+        ? speechReviewWindows(result.original.transcript,video.durationSeconds)
+        : [{from:0,to:video.durationSeconds}];
+      // Even if the provider returned no usable transcript, offer one optional
+      // transcription-focused attempt rather than silently using an editorial digest.
+      if(recoverMissingSpeech && initialGaps.length){
+        supplementalCalls++;
+        onProgress({type:'progress',step:3,label:'누락된 음성 구간 보완',attempt:i+2,detail:`확인되지 않은 음성 구간 ${initialGaps.length}곳을 추가로 확인합니다. 무료 영상 요청 1회가 추가됩니다.`});
+        try{
+          const supplement=await interaction({key,model,requestId,pass:'speech-tail',format:speechTailFormat,
+            input:[{type:'video',uri:video.url,processing:videoProcessing},{type:'text',text:focusedSpeechPrompt(video.durationSeconds,initialGaps)}],
+            signal,timeoutMs:90000,thinkingLevel:'low',maxOutputTokens:5500});
+          const added=mergeSupplementalSpeech(result.original.transcript,supplement.parsed,video.durationSeconds);
+          supplementalAdded=added.added;
+          result.original.transcript=added.lines;
+          speech=speechFirstTimeline(result.original.transcript,result.evidence,video.durationSeconds);
+          console.info(JSON.stringify({event:'analysis.speech_recovery',requestId,missingWindows:initialGaps,added:supplementalAdded,lastEndSeconds:speech.lastEnd}));
+        }catch(speechError){
+          if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+          console.warn(JSON.stringify({event:'analysis.speech_recovery_failed',requestId,code:speechError instanceof ServiceError?speechError.code:'PROVIDER_UNAVAILABLE'}));
+          result.original.exclusions.push('누락된 구간의 음성 추가 확인에 실패했습니다. 기존에 확보한 발언만 표시합니다.');
+        }
+      }
+      result.original.timeline=speech.timeline.length? speech.timeline
+        : appendUnreferencedEvidenceNotes(timelineFromEvidenceNotes(result.original.timeline,result.evidence),result.evidence);
+      if(speech.timeline.length)result.evidence=speech.evidence;
+      const unresolved=speech.timeline.length?speechReviewWindows(result.original.transcript,video.durationSeconds):[{from:0,to:video.durationSeconds}];
+      if(!speech.timeline.length)result.original.exclusions.push('음성 발언 원문을 확보하지 못했습니다. 타임라인은 AI가 작성한 요약이며, 녹취록이 아닙니다.');
+      if(unresolved.length)result.original.exclusions.push(`영상의 일부 발언 구간을 확인하지 못했습니다. 마지막 원문 근거 종료 ${Math.floor(speech.lastEnd??0)}초 / 전체 ${video.durationSeconds}초. 없는 발언을 채우지 않았습니다.`);
+      console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:'video-url',before:timelineBefore,after:result.original.timeline.length,speechLines:speech.timeline.length,recoveryCalls:supplementalCalls,recovered:supplementalAdded,unresolvedWindows:unresolved}));
       const audit=assessSinglePassCoverage(result.evidence,result.original,video.durationSeconds);
       console.info(JSON.stringify({event:'analysis.time_coverage',requestId,model,missingWindows:missingEvidenceWindows(result.evidence,video.durationSeconds),timelineCount:result.original.timeline.length}));
       console.info(JSON.stringify({event:'analysis.timeline_time_review',requestId,sourceMode:'video-url',gaps:audit.timing.gaps,lastStartSeconds:audit.timing.lastStartSeconds,lastEndSeconds:audit.timing.lastEndSeconds,aiTimesUnverified:true}));
-      result.analysisMeta={depth:'standard',videoProcessing,elapsedMs:Date.now()-analysisStarted,inputTokens:response.tokens.input??undefined,outputTokens:response.tokens.output??undefined,providerCalls:i+1,refinement:'not-needed',pipeline:'single-pass',qualityStatus:audit.incomplete?'partial':'review',sourceEndPercent:audit.lastTimelinePercent};
+      result.analysisMeta={depth:'standard',videoProcessing,elapsedMs:Date.now()-analysisStarted,inputTokens:response.tokens.input??undefined,outputTokens:response.tokens.output??undefined,providerCalls:i+1+supplementalCalls,refinement:'not-needed',pipeline:'single-pass',qualityStatus:(audit.incomplete||unresolved.length>0||!speech.timeline.length)?'partial':'review',sourceEndPercent:audit.lastTimelinePercent};
       // Time review belongs in the timeline UI, not the list of excluded facts.
       // A provider-derived timecode cannot be certified against speech without captions.
       result.edited=structuredClone(result.original);
       onProgress({type:'progress',step:4,label:'타임라인 전체 구간 검사',detail:audit.needsReview?'세부 발언의 시간 근거를 원본과 대조해주세요.':'타임라인 시간 분포와 근거 구조를 확인했습니다.'});
       const quality=assessDetail(result.original,video.durationSeconds);
-      console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'standard',videoProcessing,elapsedMs:Date.now()-analysisStarted,providerCalls:i+1,tokens:response.tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
+      console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'standard',videoProcessing,elapsedMs:Date.now()-analysisStarted,providerCalls:i+1+supplementalCalls,speechLines:speech.timeline.length,recoveredLines:supplementalAdded,missingSpeechWindows:unresolved,tokens:response.tokens,contentMetrics:quality.counts,shortFields:quality.shortFields}));
       return result;
     }catch(error){
       if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단됐습니다.',499);

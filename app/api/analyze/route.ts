@@ -19,7 +19,7 @@ export async function POST(request: Request) {
     assertSameOrigin(request);
     const status = personalModeStatus();
     if (!status.enabled) throw new ServiceError('NOT_CONFIGURED', status.reason, 503);
-    const body = await request.json() as { videoId?: unknown; requestId?: unknown; depth?: unknown; model?: unknown; captionText?: unknown; videoProcessing?: unknown; retryOnBusy?: unknown };
+    const body = await request.json() as { videoId?: unknown; requestId?: unknown; depth?: unknown; model?: unknown; captionText?: unknown; videoProcessing?: unknown; retryOnBusy?: unknown; recoverMissingSpeech?: unknown };
     const captionText=typeof body.captionText==='string'?body.captionText:'';
     if(captionText.length>MAX_CAPTION_CHARS || (body.captionText!==undefined && typeof body.captionText!=='string')) throw new ServiceError('CAPTION_TOO_LARGE','SRT/VTT 자막 입력 제한을 확인해주세요.',400);
     const videoId = typeof body.videoId === 'string' ? extractVideoId(body.videoId) : null;
@@ -30,6 +30,8 @@ export async function POST(request: Request) {
     if (!isVideoProcessingPreference(processingPreference)) throw new ServiceError('INVALID_REQUEST','허용되지 않은 영상 처리 방식입니다.',400);
     const retryOnBusy = body.retryOnBusy === undefined ? true : body.retryOnBusy;
     if (typeof retryOnBusy !== 'boolean') throw new ServiceError('INVALID_REQUEST','503 재시도 설정은 참/거짓이어야 합니다.',400);
+    const recoverMissingSpeech = body.recoverMissingSpeech===undefined ? true : body.recoverMissingSpeech;
+    if(typeof recoverMissingSpeech!=='boolean')throw new ServiceError('INVALID_REQUEST','발언 공백 복구 설정은 참/거짓이어야 합니다.',400);
     if (!model) throw new ServiceError('INVALID_MODEL', '무료 등급 허용 목록에 없는 AI 모델입니다.', 400);
     if (!videoId || !requestId) throw new ServiceError('INVALID_REQUEST', '잘못된 분석 요청입니다.', 400);
     if (activeAnalysis) throw new ServiceError('ACTIVE_JOB', '이미 진행 중인 분석이 있습니다. 이전 작업을 완료하거나 중단해주세요.', 409);
@@ -65,7 +67,7 @@ export async function POST(request: Request) {
             emit({type:'progress', step:2,label:'영상 확인 완료',detail:'무료 Gemini 모델에 영상 URL을 전달할 준비가 되었습니다.'});
             const onProgress = (event: AnalysisProgress) => emit(event);
             const analysisStarted=Date.now();
-            const result = await analyzeVideo(video, requestId, onProgress, abortController.signal, depth, model, captionText, processingPreference, retryOnBusy);
+            const result = await analyzeVideo(video, requestId, onProgress, abortController.signal, depth, model, captionText, processingPreference, retryOnBusy, recoverMissingSpeech);
             console.info(JSON.stringify({event:'analysis.timing',requestId,model,depth,videoProcessing:result.analysisMeta?.videoProcessing,metadataMs,analysisMs:Date.now()-analysisStarted,totalMs:Date.now()-requestStarted,providerCalls:result.analysisMeta?.providerCalls,timelineCount:result.original.timeline.length,articleChars:result.original.article.reduce((sum,item)=>sum+item.text.length,0)}));
             emit({type:'completed', analysis: result});
           } catch(error) {
