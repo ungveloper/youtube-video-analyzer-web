@@ -13,3 +13,14 @@ export function waitBeforeProviderRetry(signal?: AbortSignal, delayMs = BUSY_RET
     signal?.addEventListener('abort', onAbort, {once:true});
   });
 }
+
+/** The basic path shares one deadline across all possible 503 attempts. */
+export const MIN_BASIC_503_RETRY_MS = 15000;
+export function remainingBasicAnalysisMs(deadlineMs: number, nowMs: number): number {
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(nowMs)) return 0;
+  return Math.max(0, Math.floor(deadlineMs - nowMs));
+}
+/** Do not retry if the second request would have almost no time to finish. */
+export function hasBasic503RetryBudget(deadlineMs: number, nowMs: number, delayMs = BUSY_RETRY_DELAY_MS): boolean {
+  return remainingBasicAnalysisMs(deadlineMs, nowMs + delayMs) >= MIN_BASIC_503_RETRY_MS;
+}

@@ -48,7 +48,7 @@ assert.match(ai,/start_offset:`\$\{Math\.floor\(recoveryWindow\[0\]\.from\)\}s`/
 assert.match(ai,/missingSpeechWindows:unresolved/);
 const route=fs.readFileSync(path.join(root,'app/api/analyze/route.ts'),'utf8');
 const ui=fs.readFileSync(path.join(root,'components/analysis-workspace.tsx'),'utf8');
-assert.match(route,/body\.segmentShortSpeech===undefined \? true/);
+assert.match(route,/body\.segmentShortSpeech===undefined \? false/);
 assert.match(route,/recoverMissingSpeech, segmentShortSpeech\)/);
 assert.match(ui,/segmentShortSpeech,captionText/);
 assert.match(ui,/setSegmentShortSpeech/);

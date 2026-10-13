@@ -122,3 +122,12 @@
 - Logs include `analysis.segmented_speech` (`clips`, `includedSegments`, `missingSegments`, `lines`, `rejected`, `lastEnd`). `analysis.time_coverage` logs separate `missingEvidenceWindows` and `missingSpeechWindows`. Neither proves exact audio alignment.
 - This is **not** authenticated ASR or forced alignment. Gemini may still return incorrect language or miss speech, and multiple video segments in one interaction may have different latency/limits. Public timed captions, if available, remain preferred; user-supplied SRT/VTT remain authoritative. Agentic and longer videos keep prior behavior.
 - No additional default Gemini request, model fallback, paid service, persistent store, or dependency. The optional 503 retry and optional speech-recovery request remain separate settings.
+
+## v25.2 — Timeout Guard (2026-10-13)
+
+- `gemini-3.8-flash`의 202초 영상에서 실험적인 3클립 입력이 95초/126초 연속 TIMEOUT 된 운영 로그를 바탕으로 **3구간 분석 기본값을 OFF**로 전환했습니다. 옵션은 그대로 유지되지만 수동으로만 실행합니다.
+- Google 503 재시도도 **기본 OFF**로 변경했습니다. 무료 등급에서 불필요하게 2번씩 호출하거나 90초씩 새로 기다리지 않도록 기본 분석의 **전체 90초(5분 미만)** 또는 **120초(그 이상)** 시간을 동일한 예산으로 공유합니다.
+- 사용자가 503 재시도를 켜더라도 재시도 대기 2.4초 이후 15초 미만이 남으면 추가 호출하지 않습니다. 429와 TIMEOUT 자동 재시도는 없습니다.
+- `analysis.provider_timeout`과 `analysis.standard_503_retry_skipped` 로그로 제한 시간과 재시도 건너뜀을 구분합니다.
+- 이것은 **타임아웃·중복 API 소모를 줄이는 안정성 변경**이지 정확한 축자 녹취를 만드는 패치가 아닙니다. 자막을 확보하지 못하면 영상의 1분 이후 시간 밀림 또는 마지막 발언 누락이 발생할 수 있습니다. 시간 지정 SRT/VTT가 있으면 우선 사용하세요.
+- 문서: `docs/PRD-v3.3-timeout-guard.md`.
