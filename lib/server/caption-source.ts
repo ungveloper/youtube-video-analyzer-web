@@ -1,4 +1,4 @@
-/** Uses ONLY a user's supplied time-coded subtitles; no third-party caption retrieval. */
+/** Uses time-coded subtitles supplied by the user or validated public YouTube caption retrieval. */
 import type { GroundedItem, VideoInfo } from '@/lib/types';
 import type { SourceMap, SourceClaim } from '@/lib/server/evidence-pipeline';
 import { parseTimedCaptions } from '@/lib/caption-input';

@@ -14,6 +14,7 @@ import {resolveVideoProcessing, type VideoProcessingMode, type VideoProcessingPr
 import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS } from '@/lib/provider-retry';
 import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
+import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -94,7 +95,7 @@ const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
 }
-async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string;processing?:VideoProcessingMode}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium';maxOutputTokens?:number}) {
+async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string;processing?:VideoProcessingMode | {type:'static';start_offset:number;end_offset:number}}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium';maxOutputTokens?:number}) {
   const timeout=AbortSignal.timeout(args.timeoutMs);
   const signal=args.signal?AbortSignal.any([args.signal,timeout]):timeout;
   const started=Date.now();
@@ -279,10 +280,20 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+compositionCalls,sourceCalls,compositionCalls,composeRecovery:composeRecovery??null,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,sourceBuckets:audit.sourceBuckets,articleChars:audit.articleChars,sourceIncomplete:audit.sourceIncomplete,articleIncomplete:audit.articleIncomplete,composeFailureCode:composeFailureCode??null}));
   return result;
 }
-export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true,recoverMissingSpeech=true):Promise<AnalysisRecord>{
+export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true,recoverMissingSpeech=false):Promise<AnalysisRecord>{
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);
   const videoProcessing=resolveVideoProcessing(video.durationSeconds,model,processingPreference);
+  if(!captionText?.trim()){
+    onProgress({type:'progress',step:2,label:'공개 시간 지정 자막 확인',detail:'별도 Gemini 영상 호출 없이 공개 한국어 자막이 있는지 확인합니다. 사용 불가하면 기존 영상 분석을 사용합니다.'});
+    const captions=await fetchPublicKoreanCaptions(video.id,video.durationSeconds,signal);
+    console.info(JSON.stringify({event:'analysis.public_captions',requestId,available:!!captions,cueCount:captions?.count??0,endSeconds:captions?.end??null}));
+    if(captions){
+      const result=await deepAnalysis(video,model,key,requestId,onProgress,signal,captions.srt,videoProcessing,retryOnBusy);
+      if(result.analysisMeta){result.analysisMeta.sourceMode='public-captions';result.analysisMeta.depth=depth;}
+      return result;
+    }
+  }
   if(depth==='deep' || captionText?.trim())return deepAnalysis(video,model,key,requestId,onProgress,signal,captionText,videoProcessing,retryOnBusy);
   const analysisStarted=Date.now();
   const targets=detailTargets(video.durationSeconds);
@@ -312,10 +323,10 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       const recoveryWindow=chooseSpeechRecoveryWindow(initialGaps,video.durationSeconds);
       if(recoverMissingSpeech && recoveryWindow.length){
         supplementalCalls++;
-        onProgress({type:'progress',step:3,label:'누락된 음성 구간 보완',attempt:i+2,detail:`후반부 확인이 필요한 ${Math.floor(recoveryWindow[0].from)}~${Math.floor(recoveryWindow[0].to)}초 구간만 요청합니다. 무료 영상 요청 1회가 추가됩니다.`});
+        onProgress({type:'progress',step:3,label:'누락된 음성 구간 보완',attempt:i+2,detail:`${Math.floor(recoveryWindow[0].from)}~${Math.floor(recoveryWindow[0].to)}초 구간을 확인합니다. Static은 영상 자체를 해당 구간으로 제한합니다. 무료 영상 요청 1회가 추가됩니다.`});
         try{
           const supplement=await interaction({key,model,requestId,pass:'speech-tail',format:speechTailFormat,
-            input:[{type:'video',uri:video.url,processing:videoProcessing},{type:'text',text:focusedSpeechPrompt(video.durationSeconds,recoveryWindow)}],
+            input:[{type:'video',uri:video.url,processing:videoProcessing==='static'?{type:'static',start_offset:Math.floor(recoveryWindow[0].from),end_offset:Math.ceil(recoveryWindow[0].to)}:'agentic'},{type:'text',text:focusedSpeechPrompt(video.durationSeconds,recoveryWindow)}],
             signal,timeoutMs:90000,thinkingLevel:'low',maxOutputTokens:5500});
           const added=mergeSupplementalSpeech(result.original.transcript,supplement.parsed,video.durationSeconds,recoveryWindow);
           supplementalAdded=added.added;
@@ -337,6 +348,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       result.original.exclusions=result.original.exclusions.filter(text=>!/(발화\s*없음|음성\s*없음|무음|엔딩\s*카드|인트로\s*타이틀|아웃트로.*배경음악)/i.test(text));
       const unresolved=speech.timeline.length?speechReviewWindows(result.original.transcript,video.durationSeconds):[{from:0,to:video.durationSeconds}];
       if(!speech.timeline.length)result.original.exclusions.push('음성 발언 원문을 확보하지 못했습니다. 타임라인은 AI가 작성한 요약이며, 녹취록이 아닙니다.');
+      if(initialGaps.some(w=>w.from>0&&w.to<video.durationSeconds&&w.to-w.from>=25))result.original.exclusions.push('중간 발언 근거가 길게 누락되어 이후 AI 추정 시각이 실제 영상과 밀렸을 수 있습니다. 자막 없는 URL 분석 결과는 시각을 검증하지 못했습니다.');
       if(unresolved.length)result.original.exclusions.push(`영상의 일부 발언 구간을 확인하지 못했습니다. 마지막 원문 근거 종료 ${Math.floor(speech.lastEnd??0)}초 / 전체 ${video.durationSeconds}초. 없는 발언을 채우지 않았습니다.`);
       console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:'video-url',before:timelineBefore,after:result.original.timeline.length,speechLines:speech.timeline.length,recoveryCalls:supplementalCalls,recovered:supplementalAdded,unresolvedWindows:unresolved}));
       const audit=assessSinglePassCoverage(result.evidence,result.original,video.durationSeconds);

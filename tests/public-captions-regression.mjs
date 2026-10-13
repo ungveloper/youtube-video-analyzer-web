@@ -1,0 +1,65 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import ts from 'typescript';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const content=fs.readFileSync(path.join(root,'lib/public-caption-parser.ts'),'utf8');
+const output=ts.transpileModule(content,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS},reportDiagnostics:true});
+assert.equal(output.diagnostics?.length??0,0);
+const parsedModule={exports:{}};
+Function('exports','require','module',output.outputText)(parsedModule.exports,()=>{throw new Error('unexpected require')},parsedModule);
+const {parsePublicCaptionTracks,selectKoreanCaptionTrack,permittedTimedTextUrl,parsePublicJson3,hasFullCaptionCoverage,publicCuesToSrt}=parsedModule.exports;
+const url='https://www.youtube.com/api/timedtext?v=aFmUl65-2-c&lang=ko';
+const html=`<html><script>var ytInitialPlayerResponse = {"captions":{"playerCaptionsTracklistRenderer":{"captionTracks":[{"baseUrl":${JSON.stringify(url)},"languageCode":"ko","kind":"asr"},{"baseUrl":"https://www.youtube.com/api/timedtext?lang=en","languageCode":"en"}]}}};</script></html>`;
+assert.equal(parsePublicCaptionTracks(html).length,2);
+const track=selectKoreanCaptionTrack(parsePublicCaptionTracks(html));assert.equal(track.languageCode,'ko');
+assert.equal(permittedTimedTextUrl(track.baseUrl,'aFmUl65-2-c').searchParams.get('fmt'),'json3');
+assert.equal(permittedTimedTextUrl('https://evil.example/api/timedtext?v=aFmUl65-2-c','aFmUl65-2-c'),null);
+assert.equal(permittedTimedTextUrl('https://www.youtube.com.evil.example/api/timedtext?v=aFmUl65-2-c','aFmUl65-2-c'),null);
+assert.equal(permittedTimedTextUrl('http://www.youtube.com/api/timedtext?v=aFmUl65-2-c','aFmUl65-2-c'),null);
+assert.equal(permittedTimedTextUrl('https://www.youtube.com/api/timedtext?v=wrongid','aFmUl65-2-c'),null);
+const events=Array.from({length:35},(_,i)=>({tStartMs:i*5700,dDurationMs:5600,segs:[{utf8:`화자의 ${i}번째 발언입니다.`}]}));
+const cues=parsePublicJson3(JSON.stringify({events}),202);
+assert.equal(cues.length,35);
+assert.ok(hasFullCaptionCoverage(cues,202),'time-coded Korean text covers almost all of 3m22s');
+assert.match(publicCuesToSrt(cues),/00:03:13,800 --> 00:03:19,400/);
+assert.equal(hasFullCaptionCoverage(cues.filter(c=>c.startSeconds<118),202),false,'2-minute truncate is not accepted');
+assert.equal(hasFullCaptionCoverage([...cues.slice(0,7),...cues.slice(24)],202),false,'large silent-looking gap cannot be called full');
+assert.deepEqual(parsePublicJson3('{"events":[{"segs":[]}]}',202),[]);
+const server=fs.readFileSync(path.join(root,'lib/server/public-captions.ts'),'utf8');
+const ai=fs.readFileSync(path.join(root,'lib/server/ai.ts'),'utf8');
+const ui=fs.readFileSync(path.join(root,'components/analysis-workspace.tsx'),'utf8');
+const api=fs.readFileSync(path.join(root,'app/api/analyze/route.ts'),'utf8');
+assert.match(server,/hasFullCaptionCoverage\(cues,duration\)/);
+const compiledServer=ts.transpileModule(server,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
+const serverModule={exports:{}};
+Function('exports','require','module',compiledServer)(serverModule.exports,(name)=>name==='server-only'?{}:name==='@/lib/public-caption-parser'?parsedModule.exports:name==='@/lib/caption-input'?{MAX_CAPTION_CHARS:180000}:(()=>{throw Error(`Unexpected import: ${name}`)})(),serverModule);
+const {fetchPublicKoreanCaptions}=serverModule.exports;
+const originalFetch=globalThis.fetch;
+const requested=[];
+try{
+  globalThis.fetch=async (target,opts)=>{
+    requested.push({url:target.toString(),opts});
+    return new Response(requested.length%2===1?html:JSON.stringify({events}),{status:200});
+  };
+  const acquired=await fetchPublicKoreanCaptions('aFmUl65-2-c',202);
+  assert.equal(acquired.count,35);
+  assert.ok(acquired.srt.includes('03:13,800'));
+  assert.equal(requested.length,2,'public watch page and captions are fetched, no AI request');
+  assert.ok(requested.every(r=>r.opts.redirect==='error'),'no external redirects accepted');
+  requested.length=0;
+  globalThis.fetch=async(target,opts)=>{
+    requested.push({url:target.toString(),opts});
+    return new Response(requested.length%2===1?html:JSON.stringify({events:events.slice(0,21)}),{status:200});
+  };
+  assert.equal(await fetchPublicKoreanCaptions('aFmUl65-2-c',202),null,'truncated 2-minute auto captions must not be accepted as complete');
+}finally{globalThis.fetch=originalFetch;}
+
+assert.match(server,/redirect:'error'/);
+assert.match(ai,/fetchPublicKoreanCaptions\(video\.id,video\.durationSeconds,signal\)/);
+assert.match(ai,/result\.analysisMeta\.sourceMode='public-captions'/);
+assert.match(ai,/start_offset:Math\.floor\(recoveryWindow\[0\]\.from\)/);
+assert.match(ui,/useState\(false\);\s*const \[captionText/);
+assert.match(api,/body\.recoverMissingSpeech===undefined \? false/);
+console.log('PASS: public Korean time-coded subtitles, unsafe URL rejection, 3:22 whole-span coverage, text-first processing and quota-conscious default');

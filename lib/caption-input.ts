@@ -1,4 +1,4 @@
-/** User-supplied, time-coded subtitle parsing. No YouTube scraping or remote download. */
+/** Time-coded SRT/VTT parsing. Remote caption retrieval is isolated in server/public-captions.ts. */
 export type CaptionCue = { startSeconds: number; endSeconds: number; text: string };
 export const MAX_CAPTION_CHARS = 180_000;
 const stamp = (value: string): number | null => {

@@ -30,7 +30,7 @@ export async function POST(request: Request) {
     if (!isVideoProcessingPreference(processingPreference)) throw new ServiceError('INVALID_REQUEST','허용되지 않은 영상 처리 방식입니다.',400);
     const retryOnBusy = body.retryOnBusy === undefined ? true : body.retryOnBusy;
     if (typeof retryOnBusy !== 'boolean') throw new ServiceError('INVALID_REQUEST','503 재시도 설정은 참/거짓이어야 합니다.',400);
-    const recoverMissingSpeech = body.recoverMissingSpeech===undefined ? true : body.recoverMissingSpeech;
+    const recoverMissingSpeech = body.recoverMissingSpeech===undefined ? false : body.recoverMissingSpeech;
     if(typeof recoverMissingSpeech!=='boolean')throw new ServiceError('INVALID_REQUEST','발언 공백 복구 설정은 참/거짓이어야 합니다.',400);
     if (!model) throw new ServiceError('INVALID_MODEL', '무료 등급 허용 목록에 없는 AI 모델입니다.', 400);
     if (!videoId || !requestId) throw new ServiceError('INVALID_REQUEST', '잘못된 분석 요청입니다.', 400);
