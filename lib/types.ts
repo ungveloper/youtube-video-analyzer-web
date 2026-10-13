@@ -6,7 +6,7 @@ export type VideoInfo = { id: string; title: string; channel: string; thumbnail:
 export type AnalysisRecord = {
   id: string; video: VideoInfo; createdAt: string; updatedAt: string; model: string;
   evidence: Evidence[]; original: AnalysisContent; edited: AnalysisContent;
-  analysisMeta?: { depth: 'standard' | 'deep'; providerCalls: number; refinement: 'improved' | 'kept-first' | 'not-needed'; pipeline?: 'single-pass' | 'evidence-compose'; sourceClaims?: number; sourceEvidence?: number; sourceMode?: 'user-captions' | 'video-url'; qualityStatus?: 'review' | 'partial'; coveragePercent?: number; sourceEndPercent?: number; articleChars?: number; composeFailureCode?: string; composeRecovery?: 'article-only' };
+  analysisMeta?: { videoProcessing?: 'static' | 'agentic' | 'captions'; elapsedMs?: number; inputTokens?: number; outputTokens?: number; depth: 'standard' | 'deep'; providerCalls: number; refinement: 'improved' | 'kept-first' | 'not-needed'; pipeline?: 'single-pass' | 'evidence-compose'; sourceClaims?: number; sourceEvidence?: number; sourceMode?: 'user-captions' | 'video-url'; qualityStatus?: 'review' | 'partial'; coveragePercent?: number; sourceEndPercent?: number; articleChars?: number; composeFailureCode?: string; composeRecovery?: 'article-only' };
 };
 export type ApiError = { error: string; code?: string; remaining?: number };
 export type QuotaInfo = { remaining: number; completed: number; reserved: number; limit: number; enabled: boolean; reason?: string };
