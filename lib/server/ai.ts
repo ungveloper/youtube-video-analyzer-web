@@ -16,6 +16,7 @@ import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS, 
 import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
 import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
 import {shortSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
+import { readInteractionSse } from '@/lib/server/interaction-sse';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -106,11 +107,17 @@ async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:
   const signal=args.signal?AbortSignal.any([args.signal,timeout]):timeout;
   const started=Date.now();
   const processing=args.input.find(part=>part.type==='video')?.processing ?? 'text-only';
-  console.info(JSON.stringify({event:'ai.request_started',requestId:args.requestId,model:args.model,pass:args.pass,processing,thinkingLevel:args.thinkingLevel??(args.model==='gemini-3.8-flash'?'medium':'low'),maxOutputTokens:args.maxOutputTokens??16000}));
+  // Streaming is stateless (store:false) and uses the same ONE Gemini request.
+  // Do not enable Google background:true here: that requires store:true.
+  const streamed=args.pass==='standard'||args.pass==='standard-segmented';
+  console.info(JSON.stringify({event:'ai.request_started',requestId:args.requestId,model:args.model,pass:args.pass,processing,transport:streamed?'sse':'json',thinkingLevel:args.thinkingLevel??(args.model==='gemini-3.8-flash'?'medium':'low'),maxOutputTokens:args.maxOutputTokens??16000}));
   const response=await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-    method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':args.key},
+    method:'POST',headers:{'Content-Type':'application/json','Accept':streamed?'text/event-stream':'application/json','x-goog-api-key':args.key},
     cache:'no-store',signal,
-    body:JSON.stringify({model:args.model,store:false,input:args.input,generation_config:{max_output_tokens:args.maxOutputTokens??16000,thinking_level:args.thinkingLevel??(args.model==='gemini-3.8-flash'?'medium':'low')},response_format:args.format}),
+    body:JSON.stringify({model:args.model,store:false,stream:streamed,input:args.input,generation_config:{max_output_tokens:args.maxOutputTokens??16000,thinking_level:args.thinkingLevel??(args.model==='gemini-3.8-flash'?'medium':'low')},response_format:args.format}),
+  }).catch(error=>{
+    if(timeout.aborted && !args.signal?.aborted)throw new ServiceError('TIMEOUT','Gemini 응답 대기시간이 초과됐습니다.',504);
+    throw error;
   });
   if(!response.ok){
     const detail=googleErrorDetail(await response.text().catch(() => ''));
@@ -122,13 +129,28 @@ async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:
     if(!transientHttp.has(response.status))throw new ServiceError('PROVIDER_UNAVAILABLE',msg,502);
     throw new ServiceError('TEMPORARY_HTTP',msg,502);
   }
-  const data=await response.json() as InteractionResponse;
-  if(data.status && data.status!=='completed')throw new ServiceError('INTERACTION_STATUS',`Gemini 응답 상태: ${data.status}. 완료된 결과를 받지 못했습니다.`,502);
-  const output=extractInteractionText(data);
+  let output: string;
+  let tokens: {input:number|null;output:number|null};
+  if(streamed && response.headers.get('content-type')?.includes('text/event-stream')){
+    const streamedResponse=await readInteractionSse(response).catch(error=>{
+      if(timeout.aborted && !args.signal?.aborted)throw new ServiceError('TIMEOUT','Gemini 스트리밍 응답 대기시간이 초과됐습니다.',504);
+      if(error instanceof Error && /RESOURCE_EXHAUSTED|rate.limit|quota.exceeded/i.test(error.message))throw new ServiceError('FREE_LIMIT','선택한 Gemini 모델의 무료 요청 한도가 초과됐습니다.',429);
+      throw error;
+    });
+    output=streamedResponse.output;
+    tokens={input:streamedResponse.inputTokens,output:streamedResponse.outputTokens};
+    console.info(JSON.stringify({event:'ai.stream_completed',requestId:args.requestId,model:args.model,pass:args.pass,firstTextMs:streamedResponse.firstTextMs,chunks:streamedResponse.chunks,ms:Date.now()-started}));
+  }else{
+    // If a gateway returns a non-SSE JSON response, handle its body without
+    // repeating the paid/free model call or silently changing models.
+    const data=await response.json() as InteractionResponse;
+    if(data.status && data.status!=='completed')throw new ServiceError('INTERACTION_STATUS',`Gemini 응답 상태: ${data.status}. 완료된 결과를 받지 못했습니다.`,502);
+    output=extractInteractionText(data);
+    tokens={input:data.usage?.total_input_tokens??null,output:data.usage?.total_output_tokens??null};
+  }
   if(!output.trim())throw new ServiceError('INVALID_RESULT','Gemini 분석 결과가 비어 있습니다.',502);
   let parsed:unknown;
   try { parsed=decodeJson(output); }catch{throw new ServiceError('INVALID_RESULT',`${args.pass}: Gemini가 유효한 JSON을 생성하지 못했습니다.`,502);}
-  const tokens={input:data.usage?.total_input_tokens??null,output:data.usage?.total_output_tokens??null};
   const ms=Date.now()-started;
   console.info(JSON.stringify({event:'ai.request_completed',requestId:args.requestId,model:args.model,pass:args.pass,processing,ms,inputTokens:tokens.input,outputTokens:tokens.output}));
   return {parsed,tokens,ms};
@@ -306,7 +328,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
   const windows=coverageWindows(video.durationSeconds).map((w,i)=>`${i+1}구간 ${w.label}`).join(' / ');
   const detailInstructions=`타임라인의 text는 제삼자 설명문이 아니라 화자의 발언처럼 자연스럽고 원문 어순에 충실하게 작성한다. '설명함/소개함/권장함' 같은 메모체와 영상에 없는 의학적 보강을 하지 않는다. 예를 들어 화자가 '하지만 이 질병의 80%가 다리에서 시작됩니다'라고 했다면 '뇌경색 위험의 80%가 다리 질환과 연관'처럼 대상을 바꾸지 않는다. 정확하게 들리지 않으면 제외한다. 이 입력은 검증된 전사 원문이 아니므로 그대로 들었다고 확신하거나 인증하지 않는다.\n검토해야 할 실제 시간 구간: ${windows}. 후반부를 먼저 확인하되 최종 출력은 시작 시각 순서로 정렬할 것. 각 구간의 실제 발언을 따로 점검하고, 없던 발언을 새로 만들어 항목 수를 채우지 말 것.\n영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
   // Google 503 is optionally retried ONCE. Other failures, especially 429, are not retried.
-  const firstTimeoutMs=video.durationSeconds<300?90000:120000;
+  const firstTimeoutMs=video.durationSeconds<300?120000:150000;
   // A single basic analysis has ONE wall-clock budget, not 90 seconds per attempt.
   const basicDeadlineMs=Date.now()+firstTimeoutMs;
   const attempts=retryOnBusy?[firstTimeoutMs,firstTimeoutMs]:[firstTimeoutMs];let lastError:unknown;

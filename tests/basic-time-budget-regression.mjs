@@ -29,5 +29,6 @@ assert.match(ai,/const basicDeadlineMs=Date\.now\(\)\+firstTimeoutMs/);
 assert.match(ai,/timeoutMs:remainingMs/);
 assert.match(ai,/hasBasic503RetryBudget\(basicDeadlineMs,Date\.now\(\)\)/);
 assert.match(ai,/event:'analysis\.provider_timeout'/);
+assert.match(ai,/video\.durationSeconds<300\?120000:150000/);
 assert.match(ai,/event:'analysis\.standard_503_retry_skipped'/);
-console.log('PASS: 3-clip and 503 retry disabled by default, shared 90-second deadline, low-budget retry blocked, timeout stage logs');
+console.log('PASS: 3-clip and 503 retry disabled by default, shared streamed standard deadline, low-budget retry blocked, timeout stage logs');
