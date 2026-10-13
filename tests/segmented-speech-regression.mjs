@@ -9,10 +9,20 @@ const output=ts.transpileModule(src,{compilerOptions:{target:ts.ScriptTarget.ES2
 assert.equal(output.diagnostics?.length??0,0);
 const compiled={exports:{}};
 Function('exports','require','module',output.outputText)(compiled.exports,()=>{throw Error('unexpected import');},compiled);
-const {shortSpeechSegments,clipProcessing,parseSegmentedSpeech}=compiled.exports;
+const {shortSpeechSegments,clipProcessing,clipVideoInputs,parseSegmentedSpeech}=compiled.exports;
 const parts=shortSpeechSegments(202,'static');
 assert.deepEqual(parts,[{index:0,from:0,to:67},{index:1,from:67,to:135},{index:2,from:135,to:202}]);
 assert.deepEqual(clipProcessing(parts[1]),{type:'static',start_offset:'67s',end_offset:'135s'});
+const apiInputs=clipVideoInputs('https://www.youtube.com/watch?v=aFmUl65-2-c',parts);
+assert.deepEqual(apiInputs.map(x=>Object.keys(x)),[
+ ['type','uri','processing'],['type','uri','processing'],['type','uri','processing']
+],'static clip videos must NOT expose display_name/name');
+assert.deepEqual(apiInputs.map(x=>x.processing),[
+ {type:'static',start_offset:'0s',end_offset:'67s'},
+ {type:'static',start_offset:'67s',end_offset:'135s'},
+ {type:'static',start_offset:'135s',end_offset:'202s'}
+]);
+assert.ok(!/\"(?:display_name|name)\"\s*:/.test(JSON.stringify(apiInputs)),'static media payload must never contain display_name/name');
 assert.deepEqual(shortSpeechSegments(202,'agentic'),[]);
 assert.deepEqual(shortSpeechSegments(800,'static'),[]);
 const result=parseSegmentedSpeech({segmentTranscripts:[
@@ -31,6 +41,8 @@ assert.equal(invalid.lines.length,0);
 const ai=fs.readFileSync(path.join(root,'lib/server/ai.ts'),'utf8');
 assert.match(ai,/segmentShortSpeech\?shortSpeechSegments\(video\.durationSeconds,videoProcessing\):\[\]/);
 assert.match(ai,/segmentTranscripts/);
+assert.match(ai,/clipVideoInputs\(video\.url,segments\)/);
+assert.doesNotMatch(ai,/name:\s*`speech-segment/,'regression: static video content named in the outgoing request');
 assert.match(ai,/result\.original\.transcript=segmented\.lines/);
 assert.match(ai,/start_offset:`\$\{Math\.floor\(recoveryWindow\[0\]\.from\)\}s`/);
 assert.match(ai,/missingSpeechWindows:unresolved/);
@@ -41,4 +53,4 @@ assert.match(route,/recoverMissingSpeech, segmentShortSpeech\)/);
 assert.match(ui,/segmentShortSpeech,captionText/);
 assert.match(ui,/setSegmentShortSpeech/);
 assert.match(ai,/const response=await interaction\(\{key,model,requestId,pass:segments\.length\?'standard-segmented':'standard'/);
-console.log('PASS: 3 static clips in one request, provider-relative to global seconds, wrong offsets/duplicates rejected, missing tail stays partial');
+console.log('PASS: STATIC media request without display_name/name; 3 static clips in one request, provider-relative to global seconds, wrong offsets/duplicates rejected, missing tail stays partial');

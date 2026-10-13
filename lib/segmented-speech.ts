@@ -17,6 +17,12 @@ export function clipProcessing(segment:SpeechSegment){
   return {type:'static' as const,start_offset:`${segment.from}s`,end_offset:`${segment.to}s`};
 }
 
+/** REST video content builder for static clips. Google rejects 'name' (serialized
+ * as display_name) when processing is STATIC. Keep the outgoing keys minimal. */
+export function clipVideoInputs(uri:string,segments:SpeechSegment[]){
+  return segments.map(segment=>({type:'video' as const,uri,processing:clipProcessing(segment)}));
+}
+
 const signature=(text:string)=>text.replace(/[\p{P}\p{S}\s]/gu,'').toLowerCase();
 export type SegmentedSpeechResult={lines:TranscriptLine[];includedSegments:number[];rejected:number;missingSegments:number[]};
 /** Gemini's segment-relative timestamps are translated by CODE, never by a

@@ -15,7 +15,7 @@ import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS } from '@/lib/provider-retry';
 import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
 import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
-import {shortSpeechSegments,clipProcessing,parseSegmentedSpeech} from '@/lib/segmented-speech';
+import {shortSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -316,7 +316,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       const clipDirections=segments.length?`\n원본 ${video.durationSeconds}초 영상을 순서대로 정확히 3개의 독립 클립(0~${segments[0].to}초 / ${segments[1].from}~${segments[1].to}초 / ${segments[2].from}~${segments[2].to}초)으로 제공한다.
 **segmentTranscripts는 반드시 세 객체(segmentIndex 0/1/2)를 작성**한다. 각 객체의 lines에는 해당 클립에서 실제 들리는 발언을 가능한 한 빠짐없이 발언별로 작성하라. 시작·끝 초는 **원본 시각이 아닌 해당 클립 시작을 0초로 놓은 클립 내부 상대 초**로 작성한다. 예: segmentIndex=2의 5초 발언은 startSeconds=5이지 원본 140초대가 아니다. 코드가 클립 시작을 더한다. 듣지 못한 발언을 생성하거나 앞 클립 문장을 재활용하지 말라. 2번(마지막 클립)도 실제로 살펴보고 결론까지 확인하라. 일반 transcript 배열은 중복 방지를 위해 []로 작성한다. summary/article/evidence/timeline은 전체 클립을 바탕으로 작성하되 녹취처럼 검증됐다고 주장하지 말라.\n`:'';
       const input=segments.length?
-        [...segments.map(seg=>({type:'video' as const,uri:video.url,name:`speech-segment-${seg.index}`,processing:clipProcessing(seg)})),{type:'text' as const,text:prompt+'\n'+detailInstructions+clipDirections}]:
+        [...clipVideoInputs(video.url,segments),{type:'text' as const,text:prompt+'\n'+detailInstructions+clipDirections}]:
         [{type:'video' as const,uri:video.url,processing:videoProcessing},{type:'text' as const,text:prompt+'\n'+detailInstructions}];
       const response=await interaction({key,model,requestId,pass:segments.length?'standard-segmented':'standard',format:segments.length?segmentedAnalysisFormat:analysisFormat,input,signal,timeoutMs:attempts[i],thinkingLevel:'low',maxOutputTokens:video.durationSeconds<300?12000:16000});
       const result=convert(response.parsed,video,model);
