@@ -28,7 +28,8 @@ const ui=fs.readFileSync(path.join(root,'components/analysis-workspace.tsx'),'ut
 assert.match(ai,/const videoProcessing=resolveVideoProcessing/);
 assert.match(ai,/thinkingLevel:'low',maxOutputTokens:video.durationSeconds<300\?12000:16000/);
 assert.doesNotMatch(ai,/processing:'agentic' as const/);
-assert.match(ai,/const attempts=\[video.durationSeconds<300\?90000:120000\]/);
+assert.match(ai,/const attempts=retryOnBusy\?/);
+assert.match(ai,/shouldRetryProviderBusy/);
 assert.match(route,/analysis\.timing/);
 assert.match(route,/isVideoProcessingPreference\(processingPreference\)/);
 assert.match(ui,/<option value="static">Static/);

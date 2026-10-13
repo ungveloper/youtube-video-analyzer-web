@@ -32,6 +32,7 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   const [depth,setDepth]=useState<'standard'|'deep'>('standard');
   const [model,setModel]=useState<FreeModelId>(FREE_MODEL);
   const [videoProcessing,setVideoProcessing]=useState<VideoProcessingPreference>('auto');
+  const [retryOnBusy,setRetryOnBusy]=useState(true);
   const [captionText,setCaptionText]=useState('');
   const captionCheck=useMemo(()=>{if(!captionText.trim())return true;if(!video)return false;try{parseTimedCaptions(captionText,video.durationSeconds);return true;}catch{return false;}},[captionText,video]);
   const [notice,setNotice]=useState('');
@@ -48,7 +49,7 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
     return()=>clearInterval(timer);
   },[startedAt]);
   useEffect(()=>{const controllerRef=requestController;return()=>controllerRef.current?.abort();},[]);
-  const stop=()=>{requestController.current?.abort();toast.info('분석 중단을 요청했습니다.');};
+  const stop=()=>{requestController.current?.abort();};
   async function diagnose() {
     setDiagnosticBusy(true);setDiagnostic('Gemini 모델 정보를 조회하고 있습니다…');
     try {
@@ -72,15 +73,16 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   async function begin(){
     if(!video||phase==='processing')return;
     if(!captionCheck){toast.warning('자막의 시간 형식을 확인해주세요.');return;}
-    if(record&&!confirm(`새로운 무료 API 요청을 보냅니다. ${captionText.trim()?'시간 지정 원문 기반 분석은 1회':depth==='deep'?'URL 정밀 분석은 보통 2회이고 후반부 누락·오류 시 최대 5회까지 사용 가능':'기본 분석은 1회'} API 요청이 발생할 수 있습니다. 현재 결과는 새 결과로 교체됩니다. 필요한 내용은 먼저 다운로드해주세요. 다시 분석할까요?`))return;
+    if(record&&!confirm(`새로운 무료 API 요청을 보냅니다. ${captionText.trim()?'시간 지정 원문 기반 분석은 1회':depth==='deep'?'URL 정밀 분석은 보통 2회이고 후반부 누락·오류 시 최대 5회까지 사용 가능':'기본 분석은 정상 1회'}${retryOnBusy?' · 503 발생 시 한 번 더 요청할 수 있습니다.':''} API 요청이 발생할 수 있습니다. 현재 결과는 새 결과로 교체됩니다. 필요한 내용은 먼저 다운로드해주세요. 다시 분석할까요?`))return;
     const controller=new AbortController();requestController.current=controller;
     const requestId=crypto.randomUUID();
     setPhase('processing');setMessage('분석 요청을 준비하고 있습니다.');setWarning('');setFailure('');setNotice('');setEditing(false);
     setProgress({type:'progress',step:0,label:'분석 시작',detail:'서버에 요청을 전달하는 중입니다.'});
     setElapsed(0);setStartedAt(Date.now());
-    toast.loading('영상을 분석하고 있습니다…', {id:'yva-analysis',duration:Infinity});
+    // Analysis has a dedicated progress panel; avoid a second loading/error notification.
+    toast.dismiss('yva-analysis');
     try{
-      const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({videoId:video.id,requestId,depth:captionText.trim()?'deep':depth,model,videoProcessing,captionText:captionText.trim()||undefined}),signal:controller.signal,cache:'no-store'});
+      const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({videoId:video.id,requestId,depth:captionText.trim()?'deep':depth,model,videoProcessing,retryOnBusy,captionText:captionText.trim()||undefined}),signal:controller.signal,cache:'no-store'});
       const result=await readAnalysisEvents(res,event=>{
         if(controller.signal.aborted)return;
         setProgress(event);
@@ -88,12 +90,13 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
       });
       if(controller.signal.aborted)return;
       setProgress({type:'progress',step:4,label:'결과 준비 중',detail:'분석 결과를 현재 화면에 표시합니다.'});
-      setRecord(result);toast.success('영상 분석이 완료됐습니다.', {id:'yva-analysis',description:'결과를 확인한 뒤 필요한 문서를 다운로드하세요.'});setNotice('이 결과는 현재 탭에서만 유지됩니다. 필요한 내용은 다운로드해주세요.');setProgress({type:'progress',step:5,label:'완료',detail:'분석 결과가 준비되었습니다.'});setPhase('completed');setMessage('');
+      setRecord(result);toast.success('영상 분석이 완료됐습니다.', {description:'결과를 확인한 뒤 필요한 문서를 다운로드하세요.'});setNotice('이 결과는 현재 탭에서만 유지됩니다. 필요한 내용은 다운로드해주세요.');setProgress({type:'progress',step:5,label:'완료',detail:'분석 결과가 준비되었습니다.'});setPhase('completed');setMessage('');
       await loadQuota();
     }catch(e){
       const text=controller.signal.aborted?'사용자가 분석을 중단했습니다.':e instanceof Error?e.message:'분석 요청이 실패했습니다.';
-      setFailure(text);setMessage(text);setPhase(record?'completed':'ready');
-      if(controller.signal.aborted)toast.info('분석을 중단했습니다.',{id:'yva-analysis'});else toast.error('영상 분석에 실패했습니다.',{id:'yva-analysis',description:text.length>160?text.slice(0,157)+'…':text,duration:6500});
+      setFailure(controller.signal.aborted?'':text);setMessage('');setPhase(record?'completed':'ready');
+      // The full error is shown once in the inline alert; no duplicate 503 Sonner toast.
+      if(controller.signal.aborted)toast.info('분석을 중단했습니다.');
       await loadQuota();
     }finally{
       if(requestController.current===controller)requestController.current=null;
@@ -128,9 +131,9 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
     <div className="grid gap-5 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] lg:items-start">
       <div className="space-y-4 lg:sticky lg:top-5">
         <Card className="overflow-hidden">{valid?<YouTubePlayerEmbed ref={playerRef} videoId={videoId} durationSeconds={video?.durationSeconds}/>:<p className="p-6">잘못된 영상 ID</p>}<div className="p-5"><h2 className="font-semibold leading-7">{video?.title||'영상 정보를 확인하는 중입니다'}</h2><p className="mt-1 text-sm text-slate-400">{video?.channel||'YouTube'} {video?.durationSeconds?`· ${timestamp(video.durationSeconds)}`:''}</p><a className="mt-3 inline-block text-xs text-indigo-300 hover:underline" href={`https://www.youtube.com/watch?v=${videoId}`} target="_blank" rel="noopener noreferrer">YouTube에서 원본 보기 ↗</a></div></Card>
-        <Card className="p-5"><div className="flex items-center justify-between gap-2"><h3 className="font-semibold">분석 상태</h3><Badge>{phase==='completed'&&record?.analysisMeta?.qualityStatus==='partial'?'부분 분석':({checking:'조회 중',ready:'준비',processing:'분석 중',completed:'완료',error:'오류'})[phase]}</Badge></div>
+        <Card className="p-5"><div className="flex items-center justify-between gap-2"><h3 className="font-semibold">분석 상태</h3><Badge>{failure?'오류':phase==='completed'&&record?.analysisMeta?.qualityStatus==='partial'?'부분 분석':({checking:'조회 중',ready:'준비',processing:'분석 중',completed:'완료',error:'오류'})[phase]}</Badge></div>
         {failure&&<div role="alert" className="mt-3 rounded-xl border border-rose-700/50 bg-rose-950/30 px-3 py-3 text-sm leading-6 text-rose-200"><strong className="block font-semibold">분석을 완료하지 못했습니다</strong>{failure}</div>}
-        <p role="status" className="mt-3 text-sm leading-7 text-slate-400">{message||(phase==='completed'?'분석 결과를 현재 화면에서 확인할 수 있습니다. 이동·새로고침 시 사라지므로 다운로드하세요.':phase==='ready'?'공개 영상을 확인했습니다. 무료 Gemini API 설정이 활성화되면 시작할 수 있습니다.':'입력 자료와 서버 설정을 확인합니다.')}</p>
+        {!failure&&<p role="status" className="mt-3 text-sm leading-7 text-slate-400">{message||(phase==='completed'?'분석 결과를 현재 화면에서 확인할 수 있습니다. 이동·새로고침 시 사라지므로 다운로드하세요.':phase==='ready'?'공개 영상을 확인했습니다. 무료 Gemini API 설정이 활성화되면 시작할 수 있습니다.':'입력 자료와 서버 설정을 확인합니다.')}</p>}
         {phase==='processing'&&<div className="mt-4 space-y-3" aria-live="polite">
           <div className="flex items-center gap-3"><span aria-hidden="true" className="inline-block h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-indigo-300/25 border-t-indigo-300"/><div className="min-w-0 flex-1"><p className="text-sm font-medium text-indigo-100">{progress?.label||'분석 준비 중'}</p><p className="mt-1 text-xs text-slate-400">경과 {Math.floor(elapsed/60)}분 {String(elapsed%60).padStart(2,'0')}초 {progress?.attempt?`· API 요청 ${progress.attempt}회차`:''}</p></div><span className="text-sm font-semibold tabular-nums text-indigo-200">{stagePercent(progress?.step??0)}%</span></div>
           <div className="h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="분석 작업 단계 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={stagePercent(progress?.step??0)}><div className="h-full rounded-full bg-indigo-500 transition-[width] duration-500" style={{width:`${stagePercent(progress?.step??0)}%`}}/></div>
@@ -140,6 +143,10 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
         <div className="mt-4 space-y-2 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><label htmlFor="free-model-select" className="block text-xs font-semibold text-slate-200">무료 Gemini 모델</label><select id="free-model-select" value={model} disabled={phase==='processing'} onChange={e=>{setModel(e.target.value as FreeModelId);setDiagnostic('');}} className="w-full rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs text-slate-100">{FREE_MODELS.map(item=><option value={item.id} key={item.id}>{item.name}</option>)}</select><p className="text-xs leading-5 text-slate-500">선택한 모델의 Free Tier 사용 가능 여부는 AI Studio 프로젝트에서 확인해야 합니다. 유료 등급 키는 사용하지 마세요. 자동 유료 전환은 없습니다.</p></div>
         <div className="mt-4 space-y-2 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><p className="text-xs font-semibold text-slate-200">분석 깊이</p><div className="grid grid-cols-2 gap-2" role="group" aria-label="AI 분석 깊이 선택"><button type="button" aria-pressed={depth==='standard'} disabled={phase==='processing'} onClick={()=>setDepth('standard')} className={`rounded-lg border px-3 py-2 text-xs font-semibold ${depth==='standard'?'border-indigo-400 bg-indigo-500/20 text-indigo-100':'border-slate-700 text-slate-400'}`}>기본 · 1회 호출</button><button type="button" aria-pressed={depth==='deep'} disabled={phase==='processing'} onClick={()=>setDepth('deep')} className={`rounded-lg border px-3 py-2 text-xs font-semibold ${depth==='deep'?'border-indigo-400 bg-indigo-500/20 text-indigo-100':'border-slate-700 text-slate-400'}`}>정밀 · 정상 2회</button></div><p className="text-xs leading-5 text-slate-500">URL 정밀 분석은 보통 2회이며, 후반부 근거가 빠졌거나 일시 오류 시 최대 5회가 될 수 있습니다. 시간 지정 원문을 붙여넣으면 AI 호출 1회로 내용을 구성합니다. API 한도(429)에는 재시도하지 않고 유료 모델로 전환하지 않습니다.</p></div>
         <div className="mt-4 space-y-2 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><label htmlFor="video-processing" className="block text-xs font-semibold text-slate-200">영상 처리 방식</label><select id="video-processing" value={videoProcessing} onChange={e=>setVideoProcessing(e.target.value as VideoProcessingPreference)} disabled={phase==='processing'||!!captionText.trim()} className="w-full rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs text-slate-100"><option value="auto">자동 · 짧은 영상은 빠른 Static</option><option value="static">Static · 속도 우선</option><option value="agentic">Agentic · 깊은 탐색(시간 증가 가능)</option></select><p className="text-xs leading-5 text-slate-500">{captionText.trim()?'시간 지정 원문은 영상 재처리 없이 텍스트로 분석합니다.':`현재 선택: ${video?resolveVideoProcessing(video.durationSeconds,model,videoProcessing)==='static'?'Static':'Agentic':'영상 확인 후 자동 선택'} · 5분 미만은 Static 기본값. 두 방식의 속도·누락률을 같은 영상으로 비교할 수 있습니다.`}</p></div>
+        <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3 text-xs text-slate-200">
+          <input type="checkbox" className="mt-0.5 h-4 w-4 accent-indigo-500" checked={retryOnBusy} onChange={e=>setRetryOnBusy(e.target.checked)} disabled={phase==='processing'}/>
+          <span><strong className="block text-sm font-semibold">Google 503 발생 시 1회 재시도</strong><span className="mt-1 block leading-5 text-slate-400">영상 URL 분석에서 503 발생 시 2.4초 대기 후 같은 무료 모델에 한 번만 재요청합니다. 무료 API 호출이 추가되며 해제하면 즉시 실패합니다. 429는 재시도하지 않습니다.</span></span>
+        </label>
         <CaptionInputPanel value={captionText} onChange={v=>{setCaptionText(v);if(v.trim())setDepth('deep');}} duration={video?.durationSeconds||0} disabled={phase==='processing'}/>
         <Button className="mt-4 w-full" onClick={begin} disabled={!video||!captionCheck||phase==='processing'||phase==='checking'||phase==='error'||(quota?.enabled!==true)}>{phase==='processing'?<><span aria-hidden="true" className="mr-2 inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"/>분석 요청 처리 중…</>:record?`다시 분석 (${captionText.trim()?'원문 1회':depth==='deep'?'영상 정상 2회·상황에 따라 최대 5회':'영상 1회'} 무료 호출)`:`${captionText.trim()?'시간 지정 원문 (1회)':depth==='deep'?'정밀 영상 (2회)':'기본 영상 (1회)'} AI 분석 시작`}</Button>
         <Button type="button" variant="secondary" className="mt-2 w-full" disabled={diagnosticBusy||phase==='processing'} onClick={diagnose}>{diagnosticBusy?'모델 연결 확인 중…':'무료 모델 연결 진단 (AI 분석 호출 없음)'}</Button>

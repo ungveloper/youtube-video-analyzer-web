@@ -12,6 +12,7 @@ import { timelineFromSourceClaims, timelineFromEvidenceNotes, appendUnreferenced
 import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/temporal-coverage';
 import {resolveVideoProcessing, type VideoProcessingMode, type VideoProcessingPreference} from '@/lib/video-processing';
 import {assessTimelineTiming} from '@/lib/timeline-accuracy';
+import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS } from '@/lib/provider-retry';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -100,6 +101,7 @@ async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:
     console.error(JSON.stringify({event:'ai.http_error',requestId:args.requestId,model:args.model,pass:args.pass,httpStatus:response.status,providerReason:detail.code,ms:Date.now()-started}));
     const msg=googleErrorMessage(response.status,detail);
     if(response.status===429)throw new ServiceError('FREE_LIMIT',msg,429);
+    if(response.status===503)throw new ServiceError('PROVIDER_BUSY',`선택한 ${args.model} 모델이 현재 혼잡해 Google이 요청을 처리하지 못했습니다(HTTP 503). 잠시 후 다시 시도하거나 다른 무료 모델을 직접 선택해주세요. 유료 모델 자동 전환은 하지 않습니다.`,503);
     if([400,401,403,404].includes(response.status))throw new ServiceError('GOOGLE_REQUEST_REJECTED',msg,502);
     if(!transientHttp.has(response.status))throw new ServiceError('PROVIDER_UNAVAILABLE',msg,502);
     throw new ServiceError('TEMPORARY_HTTP',msg,502);
@@ -119,7 +121,7 @@ function recordFromContent(video:VideoInfo,model:string,evidence:Evidence[],cont
   const now=new Date().toISOString();
   return {id:crypto.randomUUID(),video,createdAt:now,updatedAt:now,model,evidence,original:content,edited:structuredClone(content)};
 }
-async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,captionText?:string,videoProcessing:VideoProcessingMode='static'):Promise<AnalysisRecord>{
+async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,captionText?:string,videoProcessing:VideoProcessingMode='static',retryOnBusy=true):Promise<AnalysisRecord>{
   // Source extraction is the expensive video-bearing request. Most analyses
   // use exactly two provider calls (video + text). On transient 5xx/timeouts,
   // retry ONLY this step once, retaining the user-selected model. In that case
@@ -145,10 +147,12 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
       }catch(error){
         if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
         const converted=isTimeout(error)?new ServiceError('TIMEOUT','영상 근거 추출 시간이 초과됐습니다.',504):error;
-        const retryable=converted instanceof ServiceError && ['TEMPORARY_HTTP','TIMEOUT'].includes(converted.code);
+        const retryable=converted instanceof ServiceError && (shouldRetryProviderBusy(converted.code,retry,retryOnBusy) || ['TEMPORARY_HTTP','TIMEOUT'].includes(converted.code));
         if(retry===0 && retryable){
-          console.warn(JSON.stringify({event:'analysis.source_retry_scheduled',requestId,model,code:converted.code}));
-          await new Promise<void>(resolve=>setTimeout(resolve,1400));
+          const busy=converted instanceof ServiceError && converted.code==='PROVIDER_BUSY';
+          onProgress({type:'progress',step:2,attempt:sourceCalls+1,label:busy?'Google 503 · 재시도 대기':'Google 일시 오류 · 재시도 대기',detail:`${busy?'서버 혼잡으로':'일시적인 오류로'} 잠시 대기한 뒤 동일한 무료 모델로 한 번만 재시도합니다. (${busy?BUSY_RETRY_DELAY_MS:1400}ms)`});
+          console.warn(JSON.stringify({event:'analysis.source_retry_scheduled',requestId,model,code:converted instanceof ServiceError?converted.code:'UNKNOWN'}));
+          await waitBeforeProviderRetry(signal,busy?BUSY_RETRY_DELAY_MS:1400);
           continue;
         }
         if(converted instanceof ServiceError && converted.code==='TEMPORARY_HTTP')throw new ServiceError('PROVIDER_TEMPORARY',`선택한 ${model} 모델의 영상 입력 처리에서 Google 서버 오류가 ${sourceCalls}회 발생했습니다. 다른 무료 모델을 수동으로 선택할 수 있습니다. 자동 유료 전환은 하지 않습니다. 마지막 오류: ${converted.message}`,502);
@@ -194,6 +198,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     stage2tokens=stage2.tokens;
   } catch(error) {
     if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+    if(error instanceof ServiceError && error.code==='FREE_LIMIT')throw error;
     composeFailureCode=error instanceof ServiceError?error.code:'INVALID_OR_TIMEOUT';
     console.warn(JSON.stringify({event:'analysis.compose_failed',requestId,model,code:composeFailureCode,message:error instanceof Error?error.message.slice(0,160):'unknown'}));
     content=fallbackFromSource(source);
@@ -265,21 +270,21 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+compositionCalls,sourceCalls,compositionCalls,composeRecovery:composeRecovery??null,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,sourceBuckets:audit.sourceBuckets,articleChars:audit.articleChars,sourceIncomplete:audit.sourceIncomplete,articleIncomplete:audit.articleIncomplete,composeFailureCode:composeFailureCode??null}));
   return result;
 }
-export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto'):Promise<AnalysisRecord>{
+export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true):Promise<AnalysisRecord>{
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);
   const videoProcessing=resolveVideoProcessing(video.durationSeconds,model,processingPreference);
-  if(depth==='deep' || captionText?.trim())return deepAnalysis(video,model,key,requestId,onProgress,signal,captionText,videoProcessing);
+  if(depth==='deep' || captionText?.trim())return deepAnalysis(video,model,key,requestId,onProgress,signal,captionText,videoProcessing,retryOnBusy);
   const analysisStarted=Date.now();
   const targets=detailTargets(video.durationSeconds);
   const windows=coverageWindows(video.durationSeconds).map((w,i)=>`${i+1}구간 ${w.label}`).join(' / ');
   const detailInstructions=`타임라인의 text는 제삼자 설명문이 아니라 화자의 발언처럼 자연스럽고 원문 어순에 충실하게 작성한다. '설명함/소개함/권장함' 같은 메모체와 영상에 없는 의학적 보강을 하지 않는다. 예를 들어 화자가 '하지만 이 질병의 80%가 다리에서 시작됩니다'라고 했다면 '뇌경색 위험의 80%가 다리 질환과 연관'처럼 대상을 바꾸지 않는다. 정확하게 들리지 않으면 제외한다. 이 입력은 검증된 전사 원문이 아니므로 그대로 들었다고 확신하거나 인증하지 않는다.\n검토해야 할 실제 시간 구간: ${windows}. 후반부를 먼저 확인하되 최종 출력은 시작 시각 순서로 정렬할 것. 각 구간의 실제 발언을 따로 점검하고, 없던 발언을 새로 만들어 항목 수를 채우지 말 것.\n영상 ${video.durationSeconds}초: 근거가 충분하면 요약 ${targets.summary}개 이상, 타임라인 ${targets.timeline}개 이상, 아티클 소제목 ${targets.article}개 이상을 목표로 하되 근거 없는 내용은 절대 생성하지 마라.`;
-  // Fast/basic mode: no silent second video pass after a 503/timeout.
-  // The user can retry deliberately; deep mode retains its recovery policy.
-  const attempts=[video.durationSeconds<300?90000:120000];let lastError:unknown;
+  // Google 503 is optionally retried ONCE. Other failures, especially 429, are not retried.
+  const firstTimeoutMs=video.durationSeconds<300?90000:120000;
+  const attempts=retryOnBusy?[firstTimeoutMs,firstTimeoutMs]:[firstTimeoutMs];let lastError:unknown;
   for(let i=0;i<attempts.length;i++){
     if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단됐습니다.',499);
-    onProgress({type:'progress',step:2,attempt:i+1,label:'기본 영상 분석',detail:'영상에서 근거를 찾고 한국어 결과물을 생성하고 있습니다.'});
+    onProgress({type:'progress',step:2,attempt:i+1,label:i===0?'기본 영상 분석':'Google 503 · 마지막 재시도',detail:i===0?'영상에서 근거를 찾고 한국어 결과물을 생성하고 있습니다.':'일시적인 Google 서버 혼잡으로 같은 무료 모델에 마지막 한 번 더 요청합니다.'});
     try {
       const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'video',uri:video.url,processing:videoProcessing},{type:'text',text:prompt+'\n'+detailInstructions}],signal,timeoutMs:attempts[i],thinkingLevel:'low',maxOutputTokens:video.durationSeconds<300?12000:16000});
       const result=convert(response.parsed,video,model);
@@ -300,7 +305,12 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
     }catch(error){
       if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단됐습니다.',499);
       lastError=isTimeout(error)?new ServiceError('TIMEOUT','영상 분석 시간이 초과됐습니다.',504):error;
-      // Do not hide another long video request behind a single 'basic' click.
+      if(shouldRetryProviderBusy(lastError instanceof ServiceError?lastError.code:undefined,i,retryOnBusy)){
+        console.warn(JSON.stringify({event:'analysis.standard_503_retry',requestId,model,attempt:i+2,delayMs:BUSY_RETRY_DELAY_MS}));
+        onProgress({type:'progress',step:2,attempt:i+2,label:'Google 503 · 재시도 대기',detail:'제공자 서버 혼잡으로 2.4초 대기 후 마지막 한 번 재시도합니다. 무료 API 요청 1회가 추가됩니다.'});
+        try{await waitBeforeProviderRetry(signal);}catch{throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);}
+        continue;
+      }
       break;
     }
   }
