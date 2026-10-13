@@ -29,7 +29,7 @@ assert.match(ai,/shouldRetryProviderBusy\(lastError instanceof ServiceError/);
 assert.match(ai,/shouldRetryProviderBusy\(converted\.code,retry,retryOnBusy\)/);
 assert.match(ai,/analysis\.standard_503_retry/);
 assert.match(route,/typeof retryOnBusy !== 'boolean'/);
-assert.match(route,/captionText, processingPreference, retryOnBusy, recoverMissingSpeech\)/);
+assert.match(route,/captionText, processingPreference, retryOnBusy, recoverMissingSpeech, segmentShortSpeech\)/);
 assert.match(ui,/checked=\{retryOnBusy\}/);
 assert.match(ui,/JSON\.stringify\(\{videoId:video\.id,requestId,depth:.*retryOnBusy/s);
 assert.match(ui,/toast\.dismiss\('yva-analysis'\)/);

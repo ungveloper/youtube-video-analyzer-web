@@ -15,6 +15,7 @@ import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS } from '@/lib/provider-retry';
 import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
 import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
+import {shortSpeechSegments,clipProcessing,parseSegmentedSpeech} from '@/lib/segmented-speech';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -83,6 +84,11 @@ const analysisFormat = {
           };
 
 
+/** In one free API request, ask separately about the three actual clipped
+ * video inputs. Segment-relative utterance positions are translated locally. */
+const segmentedAnalysisFormat={...analysisFormat,schema:{...analysisFormat.schema,
+  properties:{...analysisFormat.schema.properties,segmentTranscripts:{type:'array',description:'각 입력된 영상 클립마다 한 객체. 0,1,2 순서로 구간을 각각 독립 전사하라.',items:{type:'object',properties:{segmentIndex:{type:'number'},lines:{type:'array',items:{type:'object',properties:{startSeconds:{type:'number'},endSeconds:{type:'number'},text:{type:'string'}},required:['startSeconds','endSeconds','text']}}},required:['segmentIndex','lines']}}},
+  required:[...analysisFormat.schema.required,'segmentTranscripts']}};
 const speechTailFormat={type:'text',mime_type:'application/json',schema:{type:'object',properties:{lines:{type:'array',items:{type:'object',properties:{startSeconds:{type:'number'},endSeconds:{type:'number'},text:{type:'string'}},required:['startSeconds','endSeconds','text']}}},required:['lines']}};
 function focusedSpeechPrompt(duration:number,windows:Array<{from:number;to:number}>):string{
   const clock=(time:number)=>`${String(Math.floor(time/60)).padStart(2,'0')}:${String(Math.floor(time%60)).padStart(2,'0')}`;
@@ -95,7 +101,7 @@ const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || /timeout/i.test(error.message));
 }
-async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string;processing?:VideoProcessingMode | {type:'static';start_offset:number;end_offset:number}}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium';maxOutputTokens?:number}) {
+async function interaction(args:{key:string;model:FreeModelId;input:Array<{type:'text';text:string}|{type:'video';uri:string;processing?:VideoProcessingMode | {type:'static';start_offset:string;end_offset:string}}>;format:unknown;signal?:AbortSignal;timeoutMs:number;requestId:string;pass:string;thinkingLevel?:'low'|'medium';maxOutputTokens?:number}) {
   const timeout=AbortSignal.timeout(args.timeoutMs);
   const signal=args.signal?AbortSignal.any([args.signal,timeout]):timeout;
   const started=Date.now();
@@ -280,7 +286,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   console.info(JSON.stringify({event:'analysis.completed',requestId,model,depth:'deep',pipeline:'evidence-compose',providerCalls:sourceCalls+compositionCalls,sourceCalls,compositionCalls,composeRecovery:composeRecovery??null,composed,sourceClaims:source.claims.length,sourceEvidence:source.evidence.length,firstInputTokens:stage1?.tokens.input??null,firstOutputTokens:stage1?.tokens.output??null,secondTokens:stage2tokens,contentMetrics:quality.counts,shortFields:quality.shortFields,sourceMode:result.analysisMeta.sourceMode,qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,sourceBuckets:audit.sourceBuckets,articleChars:audit.articleChars,sourceIncomplete:audit.sourceIncomplete,articleIncomplete:audit.articleIncomplete,composeFailureCode:composeFailureCode??null}));
   return result;
 }
-export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true,recoverMissingSpeech=false):Promise<AnalysisRecord>{
+export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true,recoverMissingSpeech=false,segmentShortSpeech=true):Promise<AnalysisRecord>{
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);
   const videoProcessing=resolveVideoProcessing(video.durationSeconds,model,processingPreference);
@@ -306,8 +312,22 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
     if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단됐습니다.',499);
     onProgress({type:'progress',step:2,attempt:i+1,label:i===0?'기본 영상 분석':'Google 503 · 마지막 재시도',detail:i===0?'영상에서 근거를 찾고 한국어 결과물을 생성하고 있습니다.':'일시적인 Google 서버 혼잡으로 같은 무료 모델에 마지막 한 번 더 요청합니다.'});
     try {
-      const response=await interaction({key,model,requestId,pass:'standard',format:analysisFormat,input:[{type:'video',uri:video.url,processing:videoProcessing},{type:'text',text:prompt+'\n'+detailInstructions}],signal,timeoutMs:attempts[i],thinkingLevel:'low',maxOutputTokens:video.durationSeconds<300?12000:16000});
+      const segments=segmentShortSpeech?shortSpeechSegments(video.durationSeconds,videoProcessing):[];
+      const clipDirections=segments.length?`\n원본 ${video.durationSeconds}초 영상을 순서대로 정확히 3개의 독립 클립(0~${segments[0].to}초 / ${segments[1].from}~${segments[1].to}초 / ${segments[2].from}~${segments[2].to}초)으로 제공한다.
+**segmentTranscripts는 반드시 세 객체(segmentIndex 0/1/2)를 작성**한다. 각 객체의 lines에는 해당 클립에서 실제 들리는 발언을 가능한 한 빠짐없이 발언별로 작성하라. 시작·끝 초는 **원본 시각이 아닌 해당 클립 시작을 0초로 놓은 클립 내부 상대 초**로 작성한다. 예: segmentIndex=2의 5초 발언은 startSeconds=5이지 원본 140초대가 아니다. 코드가 클립 시작을 더한다. 듣지 못한 발언을 생성하거나 앞 클립 문장을 재활용하지 말라. 2번(마지막 클립)도 실제로 살펴보고 결론까지 확인하라. 일반 transcript 배열은 중복 방지를 위해 []로 작성한다. summary/article/evidence/timeline은 전체 클립을 바탕으로 작성하되 녹취처럼 검증됐다고 주장하지 말라.\n`:'';
+      const input=segments.length?
+        [...segments.map(seg=>({type:'video' as const,uri:video.url,name:`speech-segment-${seg.index}`,processing:clipProcessing(seg)})),{type:'text' as const,text:prompt+'\n'+detailInstructions+clipDirections}]:
+        [{type:'video' as const,uri:video.url,processing:videoProcessing},{type:'text' as const,text:prompt+'\n'+detailInstructions}];
+      const response=await interaction({key,model,requestId,pass:segments.length?'standard-segmented':'standard',format:segments.length?segmentedAnalysisFormat:analysisFormat,input,signal,timeoutMs:attempts[i],thinkingLevel:'low',maxOutputTokens:video.durationSeconds<300?12000:16000});
       const result=convert(response.parsed,video,model);
+      if(segments.length){
+        const segmented=parseSegmentedSpeech(response.parsed,segments);
+        // Never fall back to the provider's global-time transcript when clipped
+        // segments were requested: it reintroduces the observed 50-second drift.
+        result.original.transcript=segmented.lines;
+        console.info(JSON.stringify({event:'analysis.segmented_speech',requestId,clips:segments.map(s=>[s.from,s.to]),includedSegments:segmented.includedSegments,missingSegments:segmented.missingSegments,lines:segmented.lines.length,rejected:segmented.rejected,lastEnd:segmented.lines.at(-1)?.endSeconds??null}));
+        if(segmented.missingSegments.length)result.original.exclusions.push(`영상 클립 ${segmented.missingSegments.map(x=>x+1).join(', ')}번의 발언 결과를 확보하지 못했습니다. 없는 음성을 생성하지 않았습니다.`);
+      }
       const timelineBefore=result.original.timeline.length;
       let supplementalCalls=0;
       let supplementalAdded=0;
@@ -326,7 +346,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         onProgress({type:'progress',step:3,label:'누락된 음성 구간 보완',attempt:i+2,detail:`${Math.floor(recoveryWindow[0].from)}~${Math.floor(recoveryWindow[0].to)}초 구간을 확인합니다. Static은 영상 자체를 해당 구간으로 제한합니다. 무료 영상 요청 1회가 추가됩니다.`});
         try{
           const supplement=await interaction({key,model,requestId,pass:'speech-tail',format:speechTailFormat,
-            input:[{type:'video',uri:video.url,processing:videoProcessing==='static'?{type:'static',start_offset:Math.floor(recoveryWindow[0].from),end_offset:Math.ceil(recoveryWindow[0].to)}:'agentic'},{type:'text',text:focusedSpeechPrompt(video.durationSeconds,recoveryWindow)}],
+            input:[{type:'video',uri:video.url,processing:videoProcessing==='static'?{type:'static',start_offset:`${Math.floor(recoveryWindow[0].from)}s`,end_offset:`${Math.ceil(recoveryWindow[0].to)}s`}:'agentic'},{type:'text',text:focusedSpeechPrompt(video.durationSeconds,recoveryWindow)}],
             signal,timeoutMs:90000,thinkingLevel:'low',maxOutputTokens:5500});
           const added=mergeSupplementalSpeech(result.original.transcript,supplement.parsed,video.durationSeconds,recoveryWindow);
           supplementalAdded=added.added;
@@ -352,7 +372,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       if(unresolved.length)result.original.exclusions.push(`영상의 일부 발언 구간을 확인하지 못했습니다. 마지막 원문 근거 종료 ${Math.floor(speech.lastEnd??0)}초 / 전체 ${video.durationSeconds}초. 없는 발언을 채우지 않았습니다.`);
       console.info(JSON.stringify({event:'analysis.timeline_granularity',requestId,sourceMode:'video-url',before:timelineBefore,after:result.original.timeline.length,speechLines:speech.timeline.length,recoveryCalls:supplementalCalls,recovered:supplementalAdded,unresolvedWindows:unresolved}));
       const audit=assessSinglePassCoverage(result.evidence,result.original,video.durationSeconds);
-      console.info(JSON.stringify({event:'analysis.time_coverage',requestId,model,missingWindows:missingEvidenceWindows(result.evidence,video.durationSeconds),timelineCount:result.original.timeline.length}));
+      console.info(JSON.stringify({event:'analysis.time_coverage',requestId,model,missingEvidenceWindows:missingEvidenceWindows(result.evidence,video.durationSeconds),missingSpeechWindows:unresolved,timelineCount:result.original.timeline.length}));
       console.info(JSON.stringify({event:'analysis.timeline_time_review',requestId,sourceMode:'video-url',gaps:audit.timing.gaps,lastStartSeconds:audit.timing.lastStartSeconds,lastEndSeconds:audit.timing.lastEndSeconds,aiTimesUnverified:true}));
       result.analysisMeta={depth:'standard',videoProcessing,elapsedMs:Date.now()-analysisStarted,inputTokens:response.tokens.input??undefined,outputTokens:response.tokens.output??undefined,providerCalls:i+1+supplementalCalls,refinement:'not-needed',pipeline:'single-pass',qualityStatus:(audit.incomplete||unresolved.length>0||!speech.timeline.length)?'partial':'review',sourceEndPercent:audit.lastTimelinePercent};
       // Time review belongs in the timeline UI, not the list of excluded facts.

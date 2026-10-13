@@ -113,3 +113,12 @@
 - `01:58 / 03:22`처럼 자막이 너무 일찍 끝나거나 중간에 긴 공백이 있으면 전체 자막으로 수용하지 않습니다. 자막을 찾을 수 없으면 기존 비디오 URL 분석으로 돌아가며 **시간 정확도를 보장하지 않습니다.**
 - 기존 speech-tail 요청은 429로 실패할 수 있어 **기본 비활성화**했습니다. 선택적으로 켜면 Static의 공식 `start_offset`/`end_offset`을 사용해 시간 범위를 제한한 요청 1회를 추가합니다.
 - 개발 서버가 포트 3000에서 동작 중이어도 격리 테스트·빌드를 실행하는 적용 스크립트입니다. 자세한 내용은 `docs/PRD-v3.1-public-captions-first.md`를 참조하세요.
+
+
+### v25 · Short Static segmented speech (experimental)
+
+- With the experimental short-segment option enabled (default; switch off to restore prior whole-video request), on a 120–300 second video without usable public time-coded captions, **standard Static** analysis sends three non-overlapping, explicitly clipped video segments in **one Gemini interaction** (single request, not 3 requests). The Interactions API's `start_offset` and `end_offset` are seconds strings such as `67s`, not JavaScript numbers.
+- The response contains `segmentTranscripts`: local-time utterances for segment indexes 0, 1, and 2. Code offsets each line into the original video timeline and rejects timestamps outside their segment, duplicate utterances, implausible compressed sentences and overlaps. It never treats global-time guesses from a separate transcript as a fallback when segmented input was used.
+- Logs include `analysis.segmented_speech` (`clips`, `includedSegments`, `missingSegments`, `lines`, `rejected`, `lastEnd`). `analysis.time_coverage` logs separate `missingEvidenceWindows` and `missingSpeechWindows`. Neither proves exact audio alignment.
+- This is **not** authenticated ASR or forced alignment. Gemini may still return incorrect language or miss speech, and multiple video segments in one interaction may have different latency/limits. Public timed captions, if available, remain preferred; user-supplied SRT/VTT remain authoritative. Agentic and longer videos keep prior behavior.
+- No additional default Gemini request, model fallback, paid service, persistent store, or dependency. The optional 503 retry and optional speech-recovery request remain separate settings.
