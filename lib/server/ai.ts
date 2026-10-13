@@ -13,7 +13,7 @@ import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/tempo
 import {resolveVideoProcessing, type VideoProcessingMode, type VideoProcessingPreference} from '@/lib/video-processing';
 import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS } from '@/lib/provider-retry';
-import {speechReviewWindows, speechFirstTimeline, mergeSupplementalSpeech} from '@/lib/speech-timeline';
+import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -88,7 +88,7 @@ function focusedSpeechPrompt(duration:number,windows:Array<{from:number;to:numbe
   return `이 요청은 기존 영상 분석에서 누락된 **음성 발화만 회복**하기 위한 것이다. 같은 영상 전체를 다시 요약하지 말라.
 영상 전체 길이 ${clock(duration)}. 다음 시간 구간에 실제 들리는 문장만 한 발언마다 lines 요소 하나로 기록한다:
 ${windows.map(w=>`- ${clock(w.from)}~${clock(w.to)}`).join('\n')}
-각 lines[].text는 실제 음성의 어휘와 문장에 최대한 가까워야 한다. 제삼자 설명/주제 요약/질병 상식 추가/오디오 미확인 부분 보충/균등 시간 배분을 금지한다. 발언이 없는 구간은 빈 배열로 두고, 반드시 원래 영상의 실제 절대 시작·종료 초를 적는다. 이번 응답은 lines JSON만 작성하라.`;
+각 lines[].text는 실제 음성의 어휘와 문장에 최대한 가까워야 한다. 제삼자 설명/주제 요약/질병 상식 추가/오디오 미확인 부분 보충/균등 시간 배분을 금지한다. 발언이 없는 구간은 빈 배열로 두고, 반드시 원래 영상의 실제 절대 시작·종료 초를 적는다. 해당 구간 밖의 발언은 한 줄도 포함하지 말라. 00:02 같은 초반 시각으로 후반 발언을 옮겨 적지 말라. 이번 응답은 lines JSON만 작성하라.`;
 }
 const transientHttp = new Set([408, 500, 502, 503, 504]);
 function isTimeout(error: unknown): boolean {
@@ -302,24 +302,27 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       let supplementalAdded=0;
       // Speech-first: a model-provided utterance must NOT be overwritten by its separate
       // editorial summary. It is still an UNVERIFIED audio interpretation, not captions.
+      result.original.transcript=dedupeInitialSpeech(result.original.transcript,video.durationSeconds);
       let speech=speechFirstTimeline(result.original.transcript,result.evidence,video.durationSeconds);
       const initialGaps=speech.timeline.length
         ? speechReviewWindows(result.original.transcript,video.durationSeconds)
         : [{from:0,to:video.durationSeconds}];
-      // Even if the provider returned no usable transcript, offer one optional
-      // transcription-focused attempt rather than silently using an editorial digest.
-      if(recoverMissingSpeech && initialGaps.length){
+      // Ask only about the latest missing interval. Mixing many time windows
+      // encouraged the provider to restamp final-minute speech near 00:02.
+      const recoveryWindow=chooseSpeechRecoveryWindow(initialGaps,video.durationSeconds);
+      if(recoverMissingSpeech && recoveryWindow.length){
         supplementalCalls++;
-        onProgress({type:'progress',step:3,label:'누락된 음성 구간 보완',attempt:i+2,detail:`확인되지 않은 음성 구간 ${initialGaps.length}곳을 추가로 확인합니다. 무료 영상 요청 1회가 추가됩니다.`});
+        onProgress({type:'progress',step:3,label:'누락된 음성 구간 보완',attempt:i+2,detail:`후반부 확인이 필요한 ${Math.floor(recoveryWindow[0].from)}~${Math.floor(recoveryWindow[0].to)}초 구간만 요청합니다. 무료 영상 요청 1회가 추가됩니다.`});
         try{
           const supplement=await interaction({key,model,requestId,pass:'speech-tail',format:speechTailFormat,
-            input:[{type:'video',uri:video.url,processing:videoProcessing},{type:'text',text:focusedSpeechPrompt(video.durationSeconds,initialGaps)}],
+            input:[{type:'video',uri:video.url,processing:videoProcessing},{type:'text',text:focusedSpeechPrompt(video.durationSeconds,recoveryWindow)}],
             signal,timeoutMs:90000,thinkingLevel:'low',maxOutputTokens:5500});
-          const added=mergeSupplementalSpeech(result.original.transcript,supplement.parsed,video.durationSeconds);
+          const added=mergeSupplementalSpeech(result.original.transcript,supplement.parsed,video.durationSeconds,recoveryWindow);
           supplementalAdded=added.added;
           result.original.transcript=added.lines;
           speech=speechFirstTimeline(result.original.transcript,result.evidence,video.durationSeconds);
-          console.info(JSON.stringify({event:'analysis.speech_recovery',requestId,missingWindows:initialGaps,added:supplementalAdded,lastEndSeconds:speech.lastEnd}));
+          console.info(JSON.stringify({event:'analysis.speech_recovery',requestId,requestedWindow:recoveryWindow,added:supplementalAdded,rejected:added.rejected,rejectedOutOfWindow:added.rejectedOutOfWindow,lastEndSeconds:speech.lastEnd}));
+          if(added.rejectedOutOfWindow) result.original.exclusions.push('추가 음성 분석에서 요청 시간대 밖의 발언 시각이 반환되어 폐기했습니다. 잘못된 시각을 타임라인에 추가하지 않았습니다.');
         }catch(speechError){
           if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
           console.warn(JSON.stringify({event:'analysis.speech_recovery_failed',requestId,code:speechError instanceof ServiceError?speechError.code:'PROVIDER_UNAVAILABLE'}));
@@ -329,6 +332,9 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       result.original.timeline=speech.timeline.length? speech.timeline
         : appendUnreferencedEvidenceNotes(timelineFromEvidenceNotes(result.original.timeline,result.evidence),result.evidence);
       if(speech.timeline.length)result.evidence=speech.evidence;
+      // Unverified model declarations such as '03:10~03:22 no speech' are
+      // not evidence of silence. Do not assert them as excluded facts.
+      result.original.exclusions=result.original.exclusions.filter(text=>!/(발화\s*없음|음성\s*없음|무음|엔딩\s*카드|인트로\s*타이틀|아웃트로.*배경음악)/i.test(text));
       const unresolved=speech.timeline.length?speechReviewWindows(result.original.transcript,video.durationSeconds):[{from:0,to:video.durationSeconds}];
       if(!speech.timeline.length)result.original.exclusions.push('음성 발언 원문을 확보하지 못했습니다. 타임라인은 AI가 작성한 요약이며, 녹취록이 아닙니다.');
       if(unresolved.length)result.original.exclusions.push(`영상의 일부 발언 구간을 확인하지 못했습니다. 마지막 원문 근거 종료 ${Math.floor(speech.lastEnd??0)}초 / 전체 ${video.durationSeconds}초. 없는 발언을 채우지 않았습니다.`);
