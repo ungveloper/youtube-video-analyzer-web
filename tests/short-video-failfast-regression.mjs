@@ -51,6 +51,12 @@ function setup(response){
   composePrompt:()=>'compose',extractComposedContent:()=>({summary:[],timeline:[],article:[],transcript:[],exclusions:[]}),
   // Use the real v3.9 sentence merge and missing-window detection.
   mergeSpeechSentences:sentenceFns.mergeSpeechSentences,
+  // The fail-fast suite tests provider branching, not extra coverage listens.
+  salvageRejectedSpeech:(_outcomes,_segments,lines)=>({lines,seen:0,recovered:0,invalid:0,outsideCore:0,duplicates:0,overlappingRecovered:0,perClip:[]}),
+  planSpeechCoverageWindows:()=>[],
+  makeSpeechCoverageRequest:()=>{throw Error('Unexpected coverage review in outage harness');},
+  extractCoverageReviewRows:()=>{throw Error('Unexpected coverage review in outage harness');},
+  mergeIndependentCoverage:()=>{throw Error('Unexpected coverage review in outage harness');},
   speechReviewWindows:timingFns.speechReviewWindows,
   // This provider fail-fast suite models only one utterance per ~34s core.
   // Such deliberately sparse artificial data must not spend an extra mocked

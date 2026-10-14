@@ -19,6 +19,7 @@ import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegment
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
 import {mergeSpeechSentences} from '@/lib/speech-sentence-merge';
+import {salvageRejectedSpeech,planSpeechCoverageWindows,makeSpeechCoverageRequest,extractCoverageReviewRows,mergeIndependentCoverage} from '@/lib/speech-coverage-recovery';
 import {chooseSpeechGapAudit,mergeGapAuditedLines,planSpeechClockAudit,makeSpeechClockAuditRequest,applySpeechClockAudit} from '@/lib/speech-audit';
 import {speechClipFailureCode,shouldTryFreeModelFallback,SPEECH_PROBE_TIMEOUT_MS,SPEECH_CLIP_TIMEOUT_MS,SPEECH_FALLBACK_WAIT_MS} from '@/lib/speech-clip-recovery';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
@@ -400,11 +401,41 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
     if(rest.some(outcome=>outcome.failure==='FREE_LIMIT'))break;
   }
   const merged=collectSpeechClipResults(outcomes,segments);
-  // Never treat tiny clip fragments as complete sentences. Preserve the real
-  // first speech timestamp while combining adjacent unfinished utterances.
-  let finalLines=mergeSpeechSentences(merged.lines,video.durationSeconds);
+  // Keep distinct audible phrases the strict time-overlap filter rejected.
+  // All candidates still need a valid original clip and core ownership.
+  const preserved=salvageRejectedSpeech(outcomes,segments,merged.lines,video.durationSeconds);
+  let finalLines=mergeSpeechSentences(preserved.lines,video.durationSeconds);
+  console.info(JSON.stringify({event:'analysis.speech_preservation_audit',requestId,strictLines:merged.lines.length,rawRows:preserved.seen,salvaged:preserved.recovered,invalid:preserved.invalid,contextOnly:preserved.outsideCore,duplicates:preserved.duplicates,conflictingTimeRecovered:preserved.overlappingRecovered,perClip:preserved.perClip}));
   let auditQuotaExceeded=false;
-  const uncovered=finalLines.length>=8 ? chooseSpeechGapAudit(finalLines,video.durationSeconds,8) : null;
+  let coverageReviews=0;
+  let coverageAdded=0;
+  let clockCorrections=0;
+  // Two independent short video listens cross-check the middle of the video.
+  // Unlike text-only composition, these requests can discover absent utterances.
+  for(const [reviewIndex,coverageWindow] of planSpeechCoverageWindows(video.durationSeconds).entries()){
+    if(outcomes.some(x=>x.failure==='FREE_LIMIT')||auditQuotaExceeded)break;
+    const remaining=speechDeadline-Date.now();
+    if(remaining<15000){console.warn(JSON.stringify({event:'analysis.speech_coverage_review_skipped',requestId,reason:'time_budget',reviewIndex}));break;}
+    coverageReviews++;
+    providerCalls++;
+    onProgress({type:'progress',step:2,label:`중반 발언 누락 재확인 ${reviewIndex+1}/2`,detail:`영상 ${coverageWindow.from}~${coverageWindow.to}초를 독립적으로 다시 듣고 누락된 실제 발언을 확인합니다. 무료 요청 ${providerCalls}회차입니다.`});
+    try{
+      const secondListen=await interaction({key,model:activeModel,requestId,pass:`speech-coverage-${reviewIndex}`,input:makeSpeechCoverageRequest(video.url,coverageWindow),format:clipSpeechFormat,signal,timeoutMs:Math.min(41000,remaining-1000),thinkingLevel:'low',maxOutputTokens:4600});
+      const reviewed=extractCoverageReviewRows(secondListen.parsed,coverageWindow,video.durationSeconds);
+      const reconciled=mergeIndependentCoverage(finalLines,reviewed.lines,coverageWindow,video.durationSeconds);
+      finalLines=mergeSpeechSentences(reconciled.lines,video.durationSeconds);
+      coverageAdded+=reconciled.added;
+      clockCorrections+=reconciled.corrections;
+      console.info(JSON.stringify({event:'analysis.speech_coverage_review',requestId,reviewIndex,window:coverageWindow,heard:reviewed.lines.length,invalid:reviewed.invalid,added:reconciled.added,duplicates:reconciled.duplicates,timeCorrections:reconciled.corrections,reason:reconciled.reason,total:finalLines.length}));
+    }catch(error){
+      if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+      const code=error instanceof ServiceError?error.code:'PROVIDER_UNAVAILABLE';
+      if(code==='FREE_LIMIT')auditQuotaExceeded=true;
+      console.warn(JSON.stringify({event:'analysis.speech_coverage_review_failed',requestId,reviewIndex,code}));
+    }
+  }
+  // Avoid redundant third/fourth listens if central coverage cross-check ran.
+  const uncovered=coverageReviews===0 && finalLines.length>=8 ? chooseSpeechGapAudit(finalLines,video.durationSeconds,8) : null;
   // One bounded additional listen only for an observed large gap. No blind
   // whole-video regeneration; avoid infinite retries and respect 429/deadlines.
   if(uncovered && !outcomes.some(x=>x.failure==='FREE_LIMIT') && speechDeadline-Date.now()>17000){
@@ -427,7 +458,7 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   // timings after 01:00. Corrections require two distinct EXACT utterance
   // matches with a consistent shift; otherwise keep original timecodes.
   const clockWindow=planSpeechClockAudit(finalLines,video.durationSeconds);
-  if(clockWindow && !auditQuotaExceeded && !outcomes.some(x=>x.failure==='FREE_LIMIT') && speechDeadline-Date.now()>19000){
+  if(clockWindow && coverageReviews===0 && !auditQuotaExceeded && !outcomes.some(x=>x.failure==='FREE_LIMIT') && speechDeadline-Date.now()>19000){
     providerCalls++;
     onProgress({type:'progress',step:2,label:'1분 이후 발언 시각 재검토',detail:`영상 ${clockWindow.from}~${clockWindow.to}초의 실제 발언을 짧게 다시 듣고, 두 문장 이상 일치할 때만 시간을 보정합니다.`});
     try{
@@ -469,6 +500,8 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   const missing=formatMissingWindows(speechReviewWindows(finalLines,video.durationSeconds));
   content.exclusions=content.exclusions.filter(x=>!/(마지막 원문 근거 종료|발화 없음|영상의 일부 발언 구간)/.test(x));
   if(missing)content.exclusions.push(`발언을 확인하지 못한 시간 구간: ${missing}. 확인되지 않은 발언과 시각은 생성하지 않았습니다.`);
+  if(preserved.recovered>0 || coverageAdded>0)content.exclusions.push('영상 발언 누락 방지를 위해 겹치는 추정 시각의 서로 다른 문장과 독립 재분석에서 확인된 발언을 보존했습니다. 시각은 원본과 대조해야 합니다.');
+  if(clockCorrections>0)content.exclusions.push('일부 문장의 추정 시각을 독립 영상 재분석의 두 문장 이상 일치 결과로 보정했습니다. 정확한 초 단위 정렬을 보증하지 않습니다.');
   if(!composeOk)content.exclusions.push('발언 문서 작성에 실패해 검증 전 발언 메모만 표시합니다.');
   if(activeModel!==model)content.exclusions.push(`선택된 ${model} 모델의 제공자 오류로 허용된 다른 무료 모델(${activeModel})을 사용했습니다. 모델별 전사 품질이 다를 수 있으므로 원본과 대조해주세요.`);
   const result=recordFromContent(video,activeModel,mapped.evidence,content);
