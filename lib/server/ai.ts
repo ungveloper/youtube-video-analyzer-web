@@ -18,7 +18,8 @@ import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
-import {mergeSpeechSentences,largestSpeechGap} from '@/lib/speech-sentence-merge';
+import {mergeSpeechSentences} from '@/lib/speech-sentence-merge';
+import {chooseSpeechGapAudit,mergeGapAuditedLines,planSpeechClockAudit,makeSpeechClockAuditRequest,applySpeechClockAudit} from '@/lib/speech-audit';
 import {speechClipFailureCode,shouldTryFreeModelFallback,SPEECH_PROBE_TIMEOUT_MS,SPEECH_CLIP_TIMEOUT_MS,SPEECH_FALLBACK_WAIT_MS} from '@/lib/speech-clip-recovery';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
@@ -402,7 +403,8 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   // Never treat tiny clip fragments as complete sentences. Preserve the real
   // first speech timestamp while combining adjacent unfinished utterances.
   let finalLines=mergeSpeechSentences(merged.lines,video.durationSeconds);
-  const uncovered=finalLines.length>=12 ? largestSpeechGap(finalLines,video.durationSeconds,19) : null;
+  let auditQuotaExceeded=false;
+  const uncovered=finalLines.length>=8 ? chooseSpeechGapAudit(finalLines,video.durationSeconds,8) : null;
   // One bounded additional listen only for an observed large gap. No blind
   // whole-video regeneration; avoid infinite retries and respect 429/deadlines.
   if(uncovered && !outcomes.some(x=>x.failure==='FREE_LIMIT') && speechDeadline-Date.now()>17000){
@@ -412,11 +414,31 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
     try{
       const repaired=await interaction({key,model:activeModel,requestId,pass:'speech-gap-review',input:makeSpeechClipRequest(video.url,recoverySegment),format:clipSpeechFormat,signal,timeoutMs:Math.min(42000,speechDeadline-Date.now()),thinkingLevel:'low',maxOutputTokens:4800});
       const additions=parseSegmentedSpeech({segmentTranscripts:[{segmentIndex:100,lines:(repaired.parsed as {lines?:unknown})?.lines}]},[recoverySegment]).lines;
-      finalLines=mergeSpeechSentences([...finalLines,...additions],video.durationSeconds);
-      console.info(JSON.stringify({event:'analysis.speech_gap_review',requestId,from:uncovered.from,to:uncovered.to,received:additions.length,totalLines:finalLines.length}));
+      const checked=mergeGapAuditedLines(finalLines,additions,uncovered,video.durationSeconds);
+      finalLines=mergeSpeechSentences(checked.lines,video.durationSeconds);
+      console.info(JSON.stringify({event:'analysis.speech_gap_review',requestId,from:uncovered.from,to:uncovered.to,received:additions.length,accepted:checked.added,rejected:checked.rejected,totalLines:finalLines.length}));
     }catch(error){
       if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+      if(error instanceof ServiceError && error.code==='FREE_LIMIT')auditQuotaExceeded=true;
       console.warn(JSON.stringify({event:'analysis.speech_gap_review_failed',requestId,code:error instanceof ServiceError?error.code:'PROVIDER_UNAVAILABLE'}));
+    }
+  }
+  // One independent, SHORT video listen may corroborate model-estimated
+  // timings after 01:00. Corrections require two distinct EXACT utterance
+  // matches with a consistent shift; otherwise keep original timecodes.
+  const clockWindow=planSpeechClockAudit(finalLines,video.durationSeconds);
+  if(clockWindow && !auditQuotaExceeded && !outcomes.some(x=>x.failure==='FREE_LIMIT') && speechDeadline-Date.now()>19000){
+    providerCalls++;
+    onProgress({type:'progress',step:2,label:'1분 이후 발언 시각 재검토',detail:`영상 ${clockWindow.from}~${clockWindow.to}초의 실제 발언을 짧게 다시 듣고, 두 문장 이상 일치할 때만 시간을 보정합니다.`});
+    try{
+      const reviewed=await interaction({key,model:activeModel,requestId,pass:'speech-clock-audit',input:makeSpeechClockAuditRequest(video.url,clockWindow,finalLines),format:clipSpeechFormat,signal,timeoutMs:Math.min(32000,speechDeadline-Date.now()),thinkingLevel:'low',maxOutputTokens:2500});
+      const verified=applySpeechClockAudit(finalLines,reviewed.parsed,clockWindow,video.durationSeconds);
+      finalLines=verified.lines;
+      console.info(JSON.stringify({event:'analysis.speech_clock_audit',requestId,window:clockWindow,corrections:verified.corrections,reason:verified.reason}));
+    }catch(error){
+      if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+      if(error instanceof ServiceError && error.code==='FREE_LIMIT')auditQuotaExceeded=true;
+      console.warn(JSON.stringify({event:'analysis.speech_clock_audit_failed',requestId,code:error instanceof ServiceError?error.code:'PROVIDER_UNAVAILABLE'}));
     }
   }
   const source=speechSource(finalLines,video.durationSeconds);
@@ -427,7 +449,7 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   }
   let content=fallbackFromSource(source);
   let composeOk=false;
-  if(!outcomes.some(o=>o.failure==='FREE_LIMIT') && finalDeadline-Date.now()>=12000){
+  if(!auditQuotaExceeded && !outcomes.some(o=>o.failure==='FREE_LIMIT') && finalDeadline-Date.now()>=12000){
     onProgress({type:'progress',step:3,label:'발언 기반 문서 작성',detail:`확보한 발언 ${source.claims.length}개로 요약·아티클을 작성합니다. 발언 문장과 시각은 변경하지 않습니다.`});
     providerCalls++;
     try{

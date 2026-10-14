@@ -56,6 +56,11 @@ function setup(response){
   // Such deliberately sparse artificial data must not spend an extra mocked
   // provider request on gap recovery; the real gap policy has its own tests.
   largestSpeechGap:()=>null,
+  chooseSpeechGapAudit:()=>null,
+  planSpeechClockAudit:()=>null,
+  mergeGapAuditedLines:()=>{throw Error('Unexpected gap review in outage harness');},
+  makeSpeechClockAuditRequest:()=>{throw Error('Unexpected clock audit in outage harness');},
+  applySpeechClockAudit:()=>{throw Error('Unexpected clock audit in outage harness');},
   parseSegmentedSpeech:()=>{throw Error('Unexpected gap review in outage harness');},
   speechFirstTimeline:(lines,evidence)=>({timeline:lines.map((l,i)=>({id:`t${i}`,text:l.text})),evidence}),
   formatMissingWindows:windows=>windows.map(w=>`${w.from}-${w.to}`).join(','),
