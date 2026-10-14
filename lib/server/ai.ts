@@ -18,6 +18,7 @@ import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
+import {mergeSpeechSentences,largestSpeechGap} from '@/lib/speech-sentence-merge';
 import {speechClipFailureCode,shouldTryFreeModelFallback,SPEECH_PROBE_TIMEOUT_MS,SPEECH_CLIP_TIMEOUT_MS,SPEECH_FALLBACK_WAIT_MS} from '@/lib/speech-clip-recovery';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
@@ -398,8 +399,28 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
     if(rest.some(outcome=>outcome.failure==='FREE_LIMIT'))break;
   }
   const merged=collectSpeechClipResults(outcomes,segments);
-  const source=speechSource(merged.lines,video.durationSeconds);
-  console.info(JSON.stringify({event:'analysis.speech_clip_coverage',requestId,model:activeModel,coveredSegments:merged.coveredSegments,failedSegments:merged.failedSegments,missingWindows:merged.missingWindows,lines:merged.lines.length,rejected:merged.rejected,lastEnd:merged.lines.at(-1)?.endSeconds??null,providerCalls}));
+  // Never treat tiny clip fragments as complete sentences. Preserve the real
+  // first speech timestamp while combining adjacent unfinished utterances.
+  let finalLines=mergeSpeechSentences(merged.lines,video.durationSeconds);
+  const uncovered=finalLines.length>=12 ? largestSpeechGap(finalLines,video.durationSeconds,19) : null;
+  // One bounded additional listen only for an observed large gap. No blind
+  // whole-video regeneration; avoid infinite retries and respect 429/deadlines.
+  if(uncovered && !outcomes.some(x=>x.failure==='FREE_LIMIT') && speechDeadline-Date.now()>17000){
+    const recoverySegment={index:100,from:Math.max(0,Math.floor(uncovered.from)-3),to:Math.min(video.durationSeconds,Math.ceil(uncovered.to)+3),coreFrom:Math.max(0,Math.floor(uncovered.from)-3),coreTo:Math.min(video.durationSeconds,Math.ceil(uncovered.to)+3)};
+    providerCalls++;
+    onProgress({type:'progress',step:2,label:'누락 발언 구간 재확인',detail:`${Math.floor(uncovered.from)}~${Math.ceil(uncovered.to)}초의 긴 공백을 한 번 더 확인합니다. 무료 요청이 추가됩니다.`});
+    try{
+      const repaired=await interaction({key,model:activeModel,requestId,pass:'speech-gap-review',input:makeSpeechClipRequest(video.url,recoverySegment),format:clipSpeechFormat,signal,timeoutMs:Math.min(42000,speechDeadline-Date.now()),thinkingLevel:'low',maxOutputTokens:4800});
+      const additions=parseSegmentedSpeech({segmentTranscripts:[{segmentIndex:100,lines:(repaired.parsed as {lines?:unknown})?.lines}]},[recoverySegment]).lines;
+      finalLines=mergeSpeechSentences([...finalLines,...additions],video.durationSeconds);
+      console.info(JSON.stringify({event:'analysis.speech_gap_review',requestId,from:uncovered.from,to:uncovered.to,received:additions.length,totalLines:finalLines.length}));
+    }catch(error){
+      if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+      console.warn(JSON.stringify({event:'analysis.speech_gap_review_failed',requestId,code:error instanceof ServiceError?error.code:'PROVIDER_UNAVAILABLE'}));
+    }
+  }
+  const source=speechSource(finalLines,video.durationSeconds);
+  console.info(JSON.stringify({event:'analysis.speech_clip_coverage',requestId,model:activeModel,coveredSegments:merged.coveredSegments,failedSegments:merged.failedSegments,missingWindows:merged.missingWindows,lines:merged.lines.length,rejected:merged.rejected,lastEnd:finalLines.at(-1)?.endSeconds??null,providerCalls}));
   if(!source.claims.length){
     const code=speechClipFailureCode(outcomes);
     throw new ServiceError(code,speechClipFailureMessage(code),code==='FREE_LIMIT'?429:code==='PROVIDER_BUSY'?503:code==='TIMEOUT'?504:502);
@@ -420,19 +441,19 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   }
   // The timeline always comes from the obtained utterances. AI timecodes
   // remain unverified until checked against the actual video or timed captions.
-  const mapped=speechFirstTimeline(merged.lines,source.evidence,video.durationSeconds);
+  const mapped=speechFirstTimeline(finalLines,source.evidence,video.durationSeconds);
   content.timeline=mapped.timeline;
-  content.transcript=merged.lines;
-  const missing=formatMissingWindows(merged.missingWindows);
+  content.transcript=finalLines;
+  const missing=formatMissingWindows(speechReviewWindows(finalLines,video.durationSeconds));
   content.exclusions=content.exclusions.filter(x=>!/(마지막 원문 근거 종료|발화 없음|영상의 일부 발언 구간)/.test(x));
   if(missing)content.exclusions.push(`발언을 확인하지 못한 시간 구간: ${missing}. 확인되지 않은 발언과 시각은 생성하지 않았습니다.`);
   if(!composeOk)content.exclusions.push('발언 문서 작성에 실패해 검증 전 발언 메모만 표시합니다.');
   if(activeModel!==model)content.exclusions.push(`선택된 ${model} 모델의 제공자 오류로 허용된 다른 무료 모델(${activeModel})을 사용했습니다. 모델별 전사 품질이 다를 수 있으므로 원본과 대조해주세요.`);
   const result=recordFromContent(video,activeModel,mapped.evidence,content);
-  const partial=Boolean(merged.missingWindows.length)||!composeOk;
-  result.analysisMeta={depth:'standard',videoProcessing:'static',elapsedMs:Date.now()-started,providerCalls,refinement:composeOk?'not-needed':'kept-first',pipeline:'single-pass',sourceMode:'video-url',qualityStatus:partial?'partial':'review',sourceEndPercent:merged.lines.length?(merged.lines.at(-1)!.endSeconds/video.durationSeconds*100):0};
+  const partial=Boolean(speechReviewWindows(finalLines,video.durationSeconds).length)||Boolean(merged.failedSegments.length)||!composeOk;
+  result.analysisMeta={depth:'standard',videoProcessing:'static',elapsedMs:Date.now()-started,providerCalls,refinement:composeOk?'not-needed':'kept-first',pipeline:'single-pass',sourceMode:'video-url',qualityStatus:partial?'partial':'review',sourceEndPercent:finalLines.length?(finalLines.at(-1)!.endSeconds/video.durationSeconds*100):0};
   onProgress({type:'progress',step:4,label:partial?'구간별 발언 일부 확인':'구간별 발언 수집 완료',detail:partial?'확인하지 못한 구간은 표기하고 원문을 임의로 채우지 않았습니다.':'짧은 중복 클립의 발언 원문을 취합했습니다. 시각은 영상으로 최종 대조해주세요.'});
-  console.info(JSON.stringify({event:'analysis.completed',requestId,model:activeModel,mode:'speech-focused',providerCalls,lines:merged.lines.length,missingWindows:merged.missingWindows,composeOk,elapsedMs:Date.now()-started}));
+  console.info(JSON.stringify({event:'analysis.completed',requestId,model:activeModel,mode:'speech-focused',providerCalls,lines:finalLines.length,missingWindows:speechReviewWindows(finalLines,video.durationSeconds),composeOk,elapsedMs:Date.now()-started}));
   return result;
 }
 

@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import ts from 'typescript';
+const file=path.resolve('lib/speech-sentence-merge.ts');
+const output=ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+const lib={};Function('exports',output)(lib);
+const l=(s,e,text)=>({id:`line-${s}`,startSeconds:s,endSeconds:e,text,translated:false});
+const a=lib.mergeSpeechSentences([l(34,37,'마치 오래된 상수도'),l(37,40,'안쪽에 때가 끼어 쌓여서 점점'),l(40,43,'좁아지는 것과 같습니다.'),l(43,47,'그럼 상수도 배관의 때와 찌꺼기는'),l(47,50,'어디서 잘 쌓일까요?')],202);
+assert.equal(a.length,2);assert.equal(a[0].startSeconds,34);assert.equal(a[0].endSeconds,43);assert.match(a[0].text,/상수도 안쪽에.*점점 좁아지는/);assert.equal(a[1].startSeconds,43);
+assert.equal(lib.mergeSpeechSentences([l(0,4,'안녕하십니까.'),l(4,8,'다음 문장입니다.')],202).length,2);
+const dedupe=lib.mergeSpeechSentences([l(148,152,'이렇듯 일상생활에서 손쉽게 체크할 수 있으니'),l(149,153,'이렇듯 일상생활에서 손쉽게 체크할 수 있으니')],202);assert.equal(dedupe.length,1);
+assert.deepEqual(lib.largestSpeechGap([l(0,8,'첫 문장입니다.'),l(48,51,'다음 문장입니다.')],60),{from:8,to:48});
+assert.equal(lib.largestSpeechGap([l(0,12,'하나의 긴 문장입니다.'),l(15,29,'두 번째 문장입니다.')],30),null);
+console.log('PASS: sentence consolidation, stable earliest timestamp, exact overlap dedupe, confirmed large gap selection');

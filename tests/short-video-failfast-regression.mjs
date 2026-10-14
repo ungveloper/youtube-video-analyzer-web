@@ -11,6 +11,11 @@ const transpile=(source,file)=>{
   return result.outputText;
 };
 const policy={};Function('exports',transpile(read('lib/speech-clip-recovery.ts'),'lib/speech-clip-recovery.ts'))(policy);
+// Pure test helpers are evaluated separately from Next.js module imports.
+// The server function below is extracted with Function(...deps), so every
+// imported helper it uses MUST be injected into that evaluation environment.
+const sentenceFns={};Function('exports',transpile(read('lib/speech-sentence-merge.ts'),'lib/speech-sentence-merge.ts'))(sentenceFns);
+const timingFns={};Function('exports',transpile(read('lib/speech-timeline.ts'),'lib/speech-timeline.ts'))(timingFns);
 const ai=read('lib/server/ai.ts');
 const start=ai.indexOf('function speechClipFailureMessage(');
 const end=ai.indexOf('\nexport async function analyzeVideo(');
@@ -44,6 +49,14 @@ function setup(response){
   speechSource:(lines)=>({claims:lines.map((l,i)=>({id:`c${i}`,text:l.text})),evidence:lines.map((l,i)=>({id:`e${i}`,startSeconds:l.startSeconds,endSeconds:l.endSeconds,note:l.text})),transcript:lines}),
   fallbackFromSource:()=>({summary:[],timeline:[],article:[],transcript:[],exclusions:[]}),
   composePrompt:()=>'compose',extractComposedContent:()=>({summary:[],timeline:[],article:[],transcript:[],exclusions:[]}),
+  // Use the real v3.9 sentence merge and missing-window detection.
+  mergeSpeechSentences:sentenceFns.mergeSpeechSentences,
+  speechReviewWindows:timingFns.speechReviewWindows,
+  // This provider fail-fast suite models only one utterance per ~34s core.
+  // Such deliberately sparse artificial data must not spend an extra mocked
+  // provider request on gap recovery; the real gap policy has its own tests.
+  largestSpeechGap:()=>null,
+  parseSegmentedSpeech:()=>{throw Error('Unexpected gap review in outage harness');},
   speechFirstTimeline:(lines,evidence)=>({timeline:lines.map((l,i)=>({id:`t${i}`,text:l.text})),evidence}),
   formatMissingWindows:windows=>windows.map(w=>`${w.from}-${w.to}`).join(','),
   recordFromContent:(video,model,evidence,content)=>({video,model,evidence,original:content,edited:structuredClone(content)}),
