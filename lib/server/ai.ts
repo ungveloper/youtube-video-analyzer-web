@@ -15,7 +15,7 @@ import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS, remainingBasicAnalysisMs, hasBasic503RetryBudget } from '@/lib/provider-retry';
 import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
 import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
-import {shortSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
+import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
 import {speechClipFailureCode,shouldTryFreeModelFallback,SPEECH_PROBE_TIMEOUT_MS,SPEECH_CLIP_TIMEOUT_MS,SPEECH_FALLBACK_WAIT_MS} from '@/lib/speech-clip-recovery';
@@ -326,17 +326,18 @@ function speechClipFailureMessage(code:ReturnType<typeof speechClipFailureCode>)
 }
 async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal):Promise<AnalysisRecord>{
   const started=Date.now();
-  const segments=shortSpeechSegments(video.durationSeconds,'static');
+  const segments=precisionSpeechSegments(video.durationSeconds,'static');
+  console.info(JSON.stringify({event:'analysis.precision_clips',requestId,windows:segments.map(s=>({from:s.from,to:s.to,coreFrom:s.coreFrom,coreTo:s.coreTo}))}));
   const outcomes:Array<{segment:typeof segments[number];parsed?:unknown;failure?:string}>=[];
   let providerCalls=0;
   let activeModel:FreeModelId=model;
-  const ordered=[segments[2],segments[0],segments[1]];
+  const ordered=[segments.at(-1)!,...segments.slice(0,-1)];
 
   // A single late-clip probe establishes whether Google can actually process
   // this YouTube URL. Never issue all three requests into an observed outage.
   async function requestClip(segment:typeof segments[number],chosenModel:FreeModelId,timeoutMs:number){
     providerCalls++;
-    onProgress({type:'progress',step:2,label:`발언 구간 확인 ${segment.index+1}/3`,detail:`${chosenModel} · 영상 ${segment.from}~${segment.to}초 발언을 확인합니다. 무료 요청 ${providerCalls}회차입니다.`});
+    onProgress({type:'progress',step:2,label:`발언 구간 확인 ${segment.index+1}/${segments.length}`,detail:`${chosenModel} · 영상 ${segment.from}~${segment.to}초 발언을 확인합니다. 무료 요청 ${providerCalls}회차입니다.`});
     try{
       const req=makeSpeechClipRequest(video.url,segment);
       const output=await interaction({key,model:chosenModel,requestId,pass:`speech-clip-${segment.index}`,input:req,format:clipSpeechFormat,signal,timeoutMs,thinkingLevel:'low',maxOutputTokens:4800});
@@ -379,10 +380,23 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
     throw new ServiceError(code,speechClipFailureMessage(code),code==='FREE_LIMIT'?429:code==='PROVIDER_BUSY'?503:code==='TIMEOUT'?504:502);
   }
 
-  // Only after a successful real video response do we ask for both remaining
-  // windows. A provider returning lines:[] is not proof of silent audio.
-  const rest=await Promise.all(ordered.slice(1).map(segment=>requestClip(segment,activeModel,SPEECH_CLIP_TIMEOUT_MS)));
-  outcomes.push(...rest);
+  // Short overlapping clips limit intra-clip clock drift and help retain
+  // sentences around former 67-second boundaries. Rate-limit to two requests
+  // in flight, keep one absolute deadline, stop on 429, and keep partial work.
+  // Model-estimated local timestamps still require review against the video.
+  const speechDeadline=started+205000;
+  const finalDeadline=started+265000;
+  for(let offset=1;offset<ordered.length;offset+=2){
+    if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+    const remaining=speechDeadline-Date.now();
+    if(remaining<12000){
+      console.warn(JSON.stringify({event:'analysis.precision_deadline',requestId,providerCalls,remainingSegments:ordered.length-offset}));
+      break;
+    }
+    const rest=await Promise.all(ordered.slice(offset,offset+2).map(segment=>requestClip(segment,activeModel,Math.min(SPEECH_CLIP_TIMEOUT_MS,remaining))));
+    outcomes.push(...rest);
+    if(rest.some(outcome=>outcome.failure==='FREE_LIMIT'))break;
+  }
   const merged=collectSpeechClipResults(outcomes,segments);
   const source=speechSource(merged.lines,video.durationSeconds);
   console.info(JSON.stringify({event:'analysis.speech_clip_coverage',requestId,model:activeModel,coveredSegments:merged.coveredSegments,failedSegments:merged.failedSegments,missingWindows:merged.missingWindows,lines:merged.lines.length,rejected:merged.rejected,lastEnd:merged.lines.at(-1)?.endSeconds??null,providerCalls}));
@@ -392,11 +406,11 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   }
   let content=fallbackFromSource(source);
   let composeOk=false;
-  if(!outcomes.some(o=>o.failure==='FREE_LIMIT')){
+  if(!outcomes.some(o=>o.failure==='FREE_LIMIT') && finalDeadline-Date.now()>=12000){
     onProgress({type:'progress',step:3,label:'발언 기반 문서 작성',detail:`확보한 발언 ${source.claims.length}개로 요약·아티클을 작성합니다. 발언 문장과 시각은 변경하지 않습니다.`});
     providerCalls++;
     try{
-      const composed=await interaction({key,model:activeModel,requestId,pass:'speech-compose',input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],format:composedResponseFormat,signal,timeoutMs:75000,thinkingLevel:'low',maxOutputTokens:6500});
+      const composed=await interaction({key,model:activeModel,requestId,pass:'speech-compose',input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],format:composedResponseFormat,signal,timeoutMs:Math.min(75000,finalDeadline-Date.now()),thinkingLevel:'low',maxOutputTokens:6500});
       const parsed=extractComposedContent(composed.parsed,source);
       content={...parsed};composeOk=true;
     }catch(error){
@@ -417,7 +431,7 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   const result=recordFromContent(video,activeModel,mapped.evidence,content);
   const partial=Boolean(merged.missingWindows.length)||!composeOk;
   result.analysisMeta={depth:'standard',videoProcessing:'static',elapsedMs:Date.now()-started,providerCalls,refinement:composeOk?'not-needed':'kept-first',pipeline:'single-pass',sourceMode:'video-url',qualityStatus:partial?'partial':'review',sourceEndPercent:merged.lines.length?(merged.lines.at(-1)!.endSeconds/video.durationSeconds*100):0};
-  onProgress({type:'progress',step:4,label:partial?'구간별 발언 일부 확인':'구간별 발언 수집 완료',detail:partial?'확인하지 못한 구간은 표기하고 원문을 임의로 채우지 않았습니다.':'세 구간의 발언 원문을 취합했습니다. 시각은 영상으로 최종 대조해주세요.'});
+  onProgress({type:'progress',step:4,label:partial?'구간별 발언 일부 확인':'구간별 발언 수집 완료',detail:partial?'확인하지 못한 구간은 표기하고 원문을 임의로 채우지 않았습니다.':'짧은 중복 클립의 발언 원문을 취합했습니다. 시각은 영상으로 최종 대조해주세요.'});
   console.info(JSON.stringify({event:'analysis.completed',requestId,model:activeModel,mode:'speech-focused',providerCalls,lines:merged.lines.length,missingWindows:merged.missingWindows,composeOk,elapsedMs:Date.now()-started}));
   return result;
 }

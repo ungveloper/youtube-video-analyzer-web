@@ -8,8 +8,15 @@ import {clipProcessing,parseSegmentedSpeech,type SpeechSegment} from './segmente
 import {speechReviewWindows,type SpeechReviewWindow} from './speech-timeline';
 
 export function makeSpeechClipRequest(uri:string,segment:SpeechSegment){
+  const coreFrom=segment.coreFrom??segment.from;
+  const coreTo=segment.coreTo??segment.to;
+  const localFrom=coreFrom-segment.from;
+  const localTo=coreTo-segment.from;
   return [{type:'video' as const,uri,processing:clipProcessing(segment)},
-    {type:'text' as const,text:`이 입력은 원본 YouTube 영상의 ${segment.from}초~${segment.to}초 구간만 포함한다. 영상 전체 요약, 기사, 제목, 타임라인은 작성하지 말고 이 클립에서 한국어로 실제 들리는 발언 문장만 순서대로 받아써라. 화자의 단어 선택과 문장 순서를 가능한 한 유지한다. 발언이 생략되거나 문장을 새로 만들지 않는다. 특히 클립 맨 끝까지 확인한다. startSeconds/endSeconds는 반드시 **클립 안에서 0초부터 시작하는 상대시간**이며 원본 전체 영상 시각이 아니다. 1초에 많은 글자가 몰리는 것은 허용하지 않는다. 정확히 들리지 않는 문장은 제외한다. 응답 형식: JSON 객체 {"lines":[{"startSeconds":0,"endSeconds":3,"text":"실제로 들린 말"}]}. 다른 필드는 작성하지 않는다.`}];
+    {type:'text' as const,text:`이 입력은 원본 영상 ${segment.from}~${segment.to}초 부분만 담은 STATIC 영상 클립이다. 이 클립을 직접 듣고 실제 발언을 원래의 어순대로 한국어로 받아써라. 출력은 요약·해설·제목이 아닌 발화 전사만 포함한다.
+클립 앞뒤에는 이웃 문장이 끊기지 않도록 몇 초의 문맥이 있다. **전사 대상은 원본 ${coreFrom}초 이상 ~ ${coreTo}초 미만에 시작하는 문장들만**이다. 클립 기준으로는 ${localFrom}초 이상 ~ ${localTo}초 미만에 시작하는 문장이다. 클립 시작 전/끝 이후 발언을 만들지 말고 앞뒤 문맥의 이미 다른 구간에 배정된 문장을 중복 작성하지 마라. 전사 대상 구간에서 시작해 클립 문맥 영역까지 이어진 실제 문장은 끝까지 기록한다.
+발언들을 빠짐없이 시간순으로 전사하며, 하나의 발언 안에서도 주제나 문장이 바뀌면 분리하라. 특히 짧은 질문/연결 문장을 건너뛰거나 여러 문장을 하나로 요약하지 말 것. 정확히 들리지 않는 단어나 발언은 지어내지 마라.
+startSeconds/endSeconds는 **이번 클립의 시작이 0초인 상대시간**이며 원본 동영상 절대 시간이 아니다. 반드시 소리와 해당 문장 시작의 위치를 대조하라. 정밀하지 않은 시간을 임의로 균등 배치하지 마라. 응답은 JSON 객체 {"lines":[{"startSeconds":0,"endSeconds":3,"text":"실제 들린 말"}]}만 작성하라.`}];
 }
 
 export type ClipResult = {segment:SpeechSegment;parsed?:unknown;failure?:string};
@@ -18,7 +25,7 @@ export function collectSpeechClipResults(outcomes:ClipResult[],segments:SpeechSe
 }{
   const clips=outcomes.flatMap(o=>o.parsed? [{segmentIndex:o.segment.index,lines:(o.parsed as {lines?:unknown}).lines}]:[]);
   const parsed=parseSegmentedSpeech({segmentTranscripts:clips},segments);
-  const coveredSegments=segments.filter(s=>parsed.includedSegments.includes(s.index)&&parsed.lines.some(l=>l.startSeconds>=s.from&&l.startSeconds<s.to)).map(s=>s.index);
+  const coveredSegments=segments.filter(s=>parsed.includedSegments.includes(s.index)&&parsed.lines.some(l=>l.startSeconds>=(s.coreFrom??s.from)&&l.startSeconds<(s.coreTo??s.to))).map(s=>s.index);
   const failedSegments=segments.filter(s=>!coveredSegments.includes(s.index)).map(s=>s.index);
   const missing=speechReviewWindows(parsed.lines,segments.at(-1)?.to??0);
   // If the provider returned an empty segment, its entire interval is unknown.

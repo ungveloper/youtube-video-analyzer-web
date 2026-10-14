@@ -17,7 +17,8 @@ const end=ai.indexOf('\nexport async function analyzeVideo(');
 assert(start>0&&end>start,'Extract real server implementation to simulate provider calls');
 const fnCode=transpile(ai.slice(start,end),'speech-focused.ts');
 class ServiceError extends Error{constructor(code,message,status){super(message);this.code=code;this.status=status;}}
-const segs=[{index:0,from:0,to:67},{index:1,from:67,to:135},{index:2,from:135,to:202}];
+const bounds=[0,34,67,101,135,168,202];
+const segs=bounds.slice(0,-1).map((from,index)=>({index,from:Math.max(0,from-4),to:Math.min(202,bounds[index+1]+4),coreFrom:from,coreTo:bounds[index+1]}));
 function setup(response){
  const calls=[],events=[];let waits=0;
  const valid=(segment)=>({lines:[{startSeconds:1,endSeconds:4,text:`${segment.index}구간 실제 발언으로 가정한 모의 문장입니다.`}]});
@@ -25,7 +26,7 @@ function setup(response){
   ...policy,
   ServiceError,
   FREE_MODELS:[{id:'gemini-3.8-flash'},{id:'gemini-3.5-flash-lite'}],
-  shortSpeechSegments:()=>segs,
+  precisionSpeechSegments:()=>segs,
   makeSpeechClipRequest:(uri,segment)=>[{type:'video',uri,processing:{type:'static',start_offset:`${segment.from}s`,end_offset:`${segment.to}s`}}],
   waitBeforeProviderRetry:async()=>{waits++;},
   interaction:async args=>{
@@ -37,7 +38,7 @@ function setup(response){
   clipSpeechFormat:{},composedResponseFormat:{},
   collectSpeechClipResults:(outcomes,segments)=>{
     const lines=outcomes.flatMap(o=>((o.parsed?.lines)||[]).map(l=>({...l,id:`l${o.segment.index}`,startSeconds:l.startSeconds+o.segment.from,endSeconds:l.endSeconds+o.segment.from})));
-    const coveredSegments=[...new Set(lines.map(l=>segs.find(s=>l.startSeconds>=s.from&&l.startSeconds<s.to)?.index))];
+    const coveredSegments=[...new Set(outcomes.filter(o=>o.parsed?.lines?.length).map(o=>o.segment.index))];
     return {lines:lines.sort((a,b)=>a.startSeconds-b.startSeconds),coveredSegments,failedSegments:segments.filter(s=>!coveredSegments.includes(s.index)).map(s=>s.index),missingWindows:segments.filter(s=>!coveredSegments.includes(s.index)).map(s=>({from:s.from,to:s.to})),rejected:0};
   },
   speechSource:(lines)=>({claims:lines.map((l,i)=>({id:`c${i}`,text:l.text})),evidence:lines.map((l,i)=>({id:`e${i}`,startSeconds:l.startSeconds,endSeconds:l.endSeconds,note:l.text})),transcript:lines}),
@@ -54,7 +55,7 @@ function setup(response){
 // Same outage as the reported log: no other clip calls, just two real-video probes.
 const outage=setup(()=> 'PROVIDER_BUSY');
 await assert.rejects(outage.run(),e=>e.code==='PROVIDER_BUSY'&&e.status===503);
-assert.deepEqual(outage.calls.map(c=>[c.model,c.pass]),[['gemini-3.8-flash','speech-clip-2'],['gemini-3.5-flash-lite','speech-clip-2']]);
+assert.deepEqual(outage.calls.map(c=>[c.model,c.pass]),[['gemini-3.8-flash','speech-clip-5'],['gemini-3.5-flash-lite','speech-clip-5']]);
 assert(outage.calls.every(c=>c.timeoutMs===45000));
 assert.equal(outage.waits,1);
 
@@ -69,22 +70,31 @@ for(const code of ['FREE_LIMIT','GOOGLE_REQUEST_REJECTED']){
 const recovered=setup(args=>args.model==='gemini-3.8-flash'?'PROVIDER_BUSY':null);
 const record=await recovered.run();
 assert.equal(record.model,'gemini-3.5-flash-lite');
-assert.equal(record.original.transcript.length,3);
-assert.deepEqual(record.original.transcript.map(l=>l.startSeconds),[1,68,136]);
-assert.equal(record.analysisMeta.providerCalls,5);
-assert.equal(recovered.calls.length,5);
+assert.equal(record.original.transcript.length,6);
+assert.deepEqual(record.original.transcript.map(l=>l.startSeconds),segs.map(x=>x.from+1));
+assert.equal(record.analysisMeta.providerCalls,8);
+assert.equal(recovered.calls.length,8);
 assert(recovered.calls.slice(1).every(c=>c.model==='gemini-3.5-flash-lite'));
-assert.deepEqual(recovered.calls.slice(2,4).map(c=>c.pass).sort(),['speech-clip-0','speech-clip-1']);
-assert.equal(recovered.calls[4].pass,'speech-compose');
+assert.deepEqual(recovered.calls.slice(2,7).map(c=>c.pass).sort(),['speech-clip-0','speech-clip-1','speech-clip-2','speech-clip-3','speech-clip-4']);
+assert.equal(recovered.calls[7].pass,'speech-compose');
 assert(record.original.exclusions.some(s=>s.includes('허용된 다른 무료 모델')));
 
 // Successful first probe with failed middle clips must preserve partial speech.
-const partial=setup(args=>args.pass==='speech-clip-2'||args.pass==='speech-compose'?null:'PROVIDER_BUSY');
+const partial=setup(args=>args.pass==='speech-clip-5'||args.pass==='speech-compose'?null:'PROVIDER_BUSY');
 const partialRecord=await partial.run();
 assert.equal(partialRecord.model,'gemini-3.8-flash');
 assert.equal(partialRecord.original.transcript.length,1);
 assert.equal(partialRecord.analysisMeta.qualityStatus,'partial');
-assert.equal(partial.calls.length,4);
+assert.equal(partial.calls.length,7);
 assert(partialRecord.original.exclusions.some(s=>s.includes('발언을 확인하지 못한 시간 구간')));
 
-console.log('PASS: simulated 503 x2 exits after 2 calls; 429/permission no fallback; free-only model recovery; partial speech retained');
+// Quota during the first remaining batch must stop further video requests
+// and preserve the successful probe (never compose after a quota rejection).
+const quotaMid=setup(args=>args.pass==='speech-clip-0'?'FREE_LIMIT':null);
+const quotaRecord=await quotaMid.run();
+assert.equal(quotaMid.calls.length,3);
+assert(!quotaMid.calls.some(c=>c.pass==='speech-compose'));
+assert.equal(quotaRecord.analysisMeta.qualityStatus,'partial');
+assert(quotaRecord.original.transcript.length>=1);
+
+console.log('PASS: six overlapped precision clips; 503 x2 fail-fast; fallback same free tier; batch=2; 429; partial transcript');

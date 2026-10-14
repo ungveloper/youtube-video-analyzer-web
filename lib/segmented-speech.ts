@@ -2,7 +2,7 @@
  * A Gemini estimate within a segment still is NOT an authenticated caption. */
 import type { TranscriptLine } from './types';
 
-export type SpeechSegment = { index:number; from:number; to:number };
+export type SpeechSegment = { index:number; from:number; to:number; coreFrom?:number; coreTo?:number };
 
 /** Three non-overlapping clips, preserving the whole 2–5 minute duration.
  * Do not segment long or agentic videos: static clipping is the only supported mode. */
@@ -10,6 +10,21 @@ export function shortSpeechSegments(duration:number,processing:'static'|'agentic
   if(processing!=='static'||!Number.isFinite(duration)||duration<120||duration>300)return [];
   const first=Math.round(duration/3),second=Math.round(2*duration/3);
   return [{index:0,from:0,to:first},{index:1,from:first,to:second},{index:2,from:second,to:duration}];
+}
+
+/** For URL speech transcription only: short, overlapped static windows.
+ * coreFrom/coreTo describe unique OWNERSHIP of utterance starts. The extra
+ * 4 seconds on each side are listening context, not independent speech time.
+ * Clip timestamps are still AI estimates, never certified subtitle timings.
+ */
+export function precisionSpeechSegments(duration:number,processing:'static'|'agentic'):SpeechSegment[]{
+  if(processing!=='static'||!Number.isInteger(duration)||duration<120||duration>300)return [];
+  const count=Math.min(8,Math.ceil(duration/34));
+  const bounds=Array.from({length:count+1},(_,i)=>Math.round(duration*i/count));
+  return Array.from({length:count},(_,index)=>{
+    const coreFrom=bounds[index],coreTo=bounds[index+1];
+    return {index,from:Math.max(0,coreFrom-4),to:Math.min(duration,coreTo+4),coreFrom,coreTo};
+  });
 }
 
 /** Interactions API requires a string seconds suffix for media offsets. */
@@ -51,6 +66,10 @@ export function parseSegmentedSpeech(response:unknown,segments:SpeechSegment[]):
       const glyphs=phrase.replace(/\s/g,'').length;
       if(glyphs>Math.max(40,(end-start)*15+12)){rejected++;continue;}
       const globalStart=seg.from+start,globalEnd=seg.from+end;
+      // Only a single precise segment owns each utterance start. Neighbor
+      // contexts help hear cut-off speech, but must not duplicate its time.
+      const ownerFrom=seg.coreFrom??seg.from,ownerTo=seg.coreTo??seg.to;
+      if(globalStart<ownerFrom-0.5||globalStart>=ownerTo+0.5){rejected++;continue;}
       if(lines.some(prev=>Math.abs(prev.startSeconds-globalStart)<0.8||globalStart<prev.endSeconds-0.7&&globalEnd>prev.startSeconds+0.7)){rejected++;continue;}
       seen.add(normalized);
       lines.push({id:`segment-${seg.index}-${i}`,startSeconds:globalStart,endSeconds:globalEnd,text:phrase,translated:false});
