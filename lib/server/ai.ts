@@ -19,6 +19,7 @@ import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegment
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
 import {mergeSpeechSentences} from '@/lib/speech-sentence-merge';
+import {finalizeSpeechTimeline} from '@/lib/speech-finalize';
 import {salvageRejectedSpeech,planSpeechCoverageWindows,makeSpeechCoverageRequest,extractCoverageReviewRows,mergeIndependentCoverage} from '@/lib/speech-coverage-recovery';
 import {chooseSpeechGapAudit,mergeGapAuditedLines,planSpeechClockAudit,makeSpeechClockAuditRequest,applySpeechClockAudit} from '@/lib/speech-audit';
 import {speechClipFailureCode,shouldTryFreeModelFallback,SPEECH_PROBE_TIMEOUT_MS,SPEECH_CLIP_TIMEOUT_MS,SPEECH_FALLBACK_WAIT_MS} from '@/lib/speech-clip-recovery';
@@ -472,6 +473,11 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
       console.warn(JSON.stringify({event:'analysis.speech_clock_audit_failed',requestId,code:error instanceof ServiceError?error.code:'PROVIDER_UNAVAILABLE'}));
     }
   }
+  // All independent audio reviews are finished. Reject cross-time collages
+  // and duplicated quote fragments WITHOUT merging unrelated spoken words.
+  const finalized=finalizeSpeechTimeline(finalLines,video.durationSeconds);
+  finalLines=finalized.lines;
+  console.info(JSON.stringify({event:'analysis.speech_final_reconcile',requestId,before:finalLines.length+finalized.duplicatesRemoved+finalized.collagesQuarantined,after:finalLines.length,duplicatesRemoved:finalized.duplicatesRemoved,collagesQuarantined:finalized.collagesQuarantined,unverifiedTimeCollisions:finalized.unverifiedTimeCollisions}));
   const source=speechSource(finalLines,video.durationSeconds);
   console.info(JSON.stringify({event:'analysis.speech_clip_coverage',requestId,model:activeModel,coveredSegments:merged.coveredSegments,failedSegments:merged.failedSegments,missingWindows:merged.missingWindows,lines:merged.lines.length,rejected:merged.rejected,lastEnd:finalLines.at(-1)?.endSeconds??null,providerCalls}));
   if(!source.claims.length){
@@ -500,6 +506,8 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   const missing=formatMissingWindows(speechReviewWindows(finalLines,video.durationSeconds));
   content.exclusions=content.exclusions.filter(x=>!/(마지막 원문 근거 종료|발화 없음|영상의 일부 발언 구간)/.test(x));
   if(missing)content.exclusions.push(`발언을 확인하지 못한 시간 구간: ${missing}. 확인되지 않은 발언과 시각은 생성하지 않았습니다.`);
+  if(finalized.collagesQuarantined)content.exclusions.push(`서로 다른 시간대의 발언이 섞인 것으로 의심되는 문장 ${finalized.collagesQuarantined}개는 타임라인에서 제외했습니다. 원본 영상 대조가 필요합니다.`);
+  if(finalized.unverifiedTimeCollisions)content.exclusions.push(`내용이 다른 문장 사이의 추정 시각 겹침 ${finalized.unverifiedTimeCollisions}건은 실제 음성 시각을 검증하지 못해 그대로 보존했습니다.`);
   if(preserved.recovered>0 || coverageAdded>0)content.exclusions.push('영상 발언 누락 방지를 위해 겹치는 추정 시각의 서로 다른 문장과 독립 재분석에서 확인된 발언을 보존했습니다. 시각은 원본과 대조해야 합니다.');
   if(clockCorrections>0)content.exclusions.push('일부 문장의 추정 시각을 독립 영상 재분석의 두 문장 이상 일치 결과로 보정했습니다. 정확한 초 단위 정렬을 보증하지 않습니다.');
   if(!composeOk)content.exclusions.push('발언 문서 작성에 실패해 검증 전 발언 메모만 표시합니다.');
