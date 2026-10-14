@@ -1,25 +1,24 @@
-/** Bounded recovery policy for the one-click speech-only clip pipeline.
- * Never treat a Google 503 response as evidence that a video has no speech.
- * Do not retry free-tier quota exhaustion or silently change paid/free models.
+/** Provider outage guard for one-click short-video analysis.
+ * If the first video clip fails with an upstream 503 or timeout, make at most
+ * ONE probe with another explicitly allowlisted FREE model. Never retry 429,
+ * change to a paid model, or treat a provider failure as evidence of silence.
  */
-import { BUSY_RETRY_DELAY_MS } from './provider-retry';
-
 export type SpeechClipOutcomeForFailure = {failure?:string};
 export type SpeechClipFinalFailure =
   | 'FREE_LIMIT' | 'GOOGLE_REQUEST_REJECTED' | 'PROVIDER_BUSY'
   | 'TIMEOUT' | 'PROVIDER_UNAVAILABLE' | 'INVALID_RESULT';
 
-/** Two consecutive unsuccessful provider-busy recoveries stop further requests.
- * Delay grows from 2.4s to 4.8s; the first pass remains at most three calls.
- */
-export function speechClipRetryDelayMs(code:string|undefined,consecutiveBusy:number):number|null {
-  if(code!=='PROVIDER_BUSY'||!Number.isInteger(consecutiveBusy)||consecutiveBusy<0||consecutiveBusy>=2)return null;
-  return BUSY_RETRY_DELAY_MS*(consecutiveBusy+1);
+// Each failed-provider probe has an explicit deadline. Avoid queuing three
+// independently expensive video calls before establishing service health.
+export const SPEECH_PROBE_TIMEOUT_MS = 45000;
+export const SPEECH_CLIP_TIMEOUT_MS = 65000;
+export const SPEECH_FALLBACK_WAIT_MS = 1600;
+
+export function shouldTryFreeModelFallback(code:string|undefined):boolean {
+  return code==='PROVIDER_BUSY'||code==='TIMEOUT';
 }
 
-/** An empty transcript is a data-quality failure ONLY if it is not explained
- * by a rejected/failed upstream request. Preserve the actionable provider code.
- */
+/** Empty transcripts caused by provider failure must surface upstream codes. */
 export function speechClipFailureCode(outcomes:SpeechClipOutcomeForFailure[]):SpeechClipFinalFailure {
   const reasons=new Set(outcomes.map(outcome=>outcome.failure).filter((s):s is string=>Boolean(s)));
   if(reasons.has('FREE_LIMIT'))return 'FREE_LIMIT';

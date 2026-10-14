@@ -1,7 +1,7 @@
 import 'server-only';
 import type { AnalysisContent,AnalysisRecord,Evidence,GroundedItem,TranscriptLine,VideoInfo } from '@/lib/types';
 import { ServiceError } from '@/lib/server/video';
-import { FREE_MODEL, type FreeModelId } from '@/lib/free-models';
+import { FREE_MODEL, FREE_MODELS, type FreeModelId } from '@/lib/free-models';
 import type { AnalysisProgress } from '@/lib/analysis-stream';
 import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error';
 import { assessDetail, detailTargets } from '@/lib/analysis-detail';
@@ -18,7 +18,7 @@ import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
 import {shortSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
-import {speechClipFailureCode,speechClipRetryDelayMs} from '@/lib/speech-clip-recovery';
+import {speechClipFailureCode,shouldTryFreeModelFallback,SPEECH_PROBE_TIMEOUT_MS,SPEECH_CLIP_TIMEOUT_MS,SPEECH_FALLBACK_WAIT_MS} from '@/lib/speech-clip-recovery';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
 // targets are aspirational and must never override source accuracy.
 const prompt = `역할: 영상의 발언을 순서대로 정리하는 전문 한국어 기록 편집자.
@@ -313,92 +313,90 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
 // Focus on audible speech ONLY in each independent static clip. Unlike a combined
 // video+article request, this does not ask Gemini to compose prose while listening.
 const clipSpeechFormat={type:'text',mime_type:'application/json',schema:{type:'object',properties:{lines:{type:'array',items:{type:'object',properties:{startSeconds:{type:'number'},endSeconds:{type:'number'},text:{type:'string'}},required:['startSeconds','endSeconds','text']}}},required:['lines']}};
+function speechClipFailureMessage(code:ReturnType<typeof speechClipFailureCode>):string {
+  const messageByCode:Record<ReturnType<typeof speechClipFailureCode>,string>={
+    FREE_LIMIT:'Gemini 무료 할당량이 소진되어 발언을 확보하지 못했습니다. 추가 API 호출을 중단했습니다.',
+    GOOGLE_REQUEST_REJECTED:'Google이 영상 분석 요청을 거절했습니다. API 키·모델·영상 접근 권한을 확인해주세요.',
+    PROVIDER_BUSY:'Gemini가 영상 입력에서 HTTP 503을 반복 반환했습니다. 다른 무료 모델의 연결도 확인했으나 발언을 확보하지 못했습니다. Gemini 제공자 상태 또는 해당 YouTube URL 처리 문제일 수 있습니다. 영상에 음성이 없다는 의미는 아닙니다.',
+    TIMEOUT:'Gemini 영상 입력 처리가 제한시간 내에 완료되지 않았습니다. 추가 영상 구간 호출을 중단했습니다.',
+    PROVIDER_UNAVAILABLE:'Gemini 영상 입력 실패로 발언을 확보하지 못했습니다. 터미널 로그에서 요청 ID와 제공자 오류를 확인해주세요.',
+    INVALID_RESULT:'영상에서 확인 가능한 발언을 확보하지 못했습니다. 검증되지 않은 발언을 임의로 생성하지 않습니다.',
+  };
+  return messageByCode[code];
+}
 async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:string,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal):Promise<AnalysisRecord>{
   const started=Date.now();
   const segments=shortSpeechSegments(video.durationSeconds,'static');
   const outcomes:Array<{segment:typeof segments[number];parsed?:unknown;failure?:string}>=[];
   let providerCalls=0;
-  // At most two video requests in flight. Never retry 429/503 automatically or
-  // switch to paid models. The last clip is requested first so its audio cannot
-  // be lost merely because a previous clip contained a long explanation.
+  let activeModel:FreeModelId=model;
   const ordered=[segments[2],segments[0],segments[1]];
-  for(let offset=0;offset<ordered.length;offset+=2){
-    const batch=ordered.slice(offset,offset+2);
-    const results=await Promise.all(batch.map(async segment=>{
-      providerCalls++;
-      onProgress({type:'progress',step:2,label:`발언 구간 확인 ${segment.index+1}/3`,detail:`영상 ${segment.from}~${segment.to}초: 요약 없이 실제 들리는 발언만 추출합니다. 무료 요청을 사용합니다.`});
-      try{
-        const req=makeSpeechClipRequest(video.url,segment);
-        const output=await interaction({key,model,requestId,pass:`speech-clip-${segment.index}`,input:req,format:clipSpeechFormat,signal,timeoutMs:85000,thinkingLevel:'low',maxOutputTokens:4800});
-        return {segment,parsed:output.parsed};
-      }catch(err){
-        if(signal?.aborted)throw err;
-        const code=err instanceof ServiceError?err.code:'UNKNOWN';
-        console.warn(JSON.stringify({event:'analysis.speech_clip_failed',requestId,index:segment.index,from:segment.from,to:segment.to,code}));
-        return {segment,failure:code};
-      }
-    }));
-    outcomes.push(...results);
-    if(results.some(x=>x.failure==='FREE_LIMIT'))break;
-  }
-  // HTTP 503 means Google did not analyze this audio; it does NOT mean the clip
-  // was silent. Recover only failed busy clips, sequentially, and preserve every
-  // successful first-pass transcript. Two consecutive retry 503s stop recovery.
-  // This is independent of the optional standard/deep-mode retry switch.
-  let consecutiveBusy=0;
-  for(const outcome of outcomes){
-    if(outcomes.some(x=>x.failure==='FREE_LIMIT'))break;
-    if(outcome.failure!=='PROVIDER_BUSY')continue;
-    const delayMs=speechClipRetryDelayMs(outcome.failure,consecutiveBusy);
-    if(delayMs===null){
-      console.warn(JSON.stringify({event:'analysis.speech_clip_retry_stopped',requestId,model,reason:'consecutive_provider_busy',consecutiveBusy}));
-      break;
-    }
-    onProgress({type:'progress',step:2,attempt:2,label:`Gemini 혼잡 · ${outcome.segment.index+1}/3 구간 재시도`,detail:`Google HTTP 503으로 확보하지 못한 ${outcome.segment.from}~${outcome.segment.to}초 발언을 ${delayMs/1000}초 후 같은 무료 모델로 한 번 더 확인합니다. 무료 요청이 추가됩니다.`});
-    console.warn(JSON.stringify({event:'analysis.speech_clip_retry',requestId,model,index:outcome.segment.index,delayMs,consecutiveBusy}));
-    try{await waitBeforeProviderRetry(signal,delayMs);}
-    catch{throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);}
-    if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
+
+  // A single late-clip probe establishes whether Google can actually process
+  // this YouTube URL. Never issue all three requests into an observed outage.
+  async function requestClip(segment:typeof segments[number],chosenModel:FreeModelId,timeoutMs:number){
     providerCalls++;
+    onProgress({type:'progress',step:2,label:`발언 구간 확인 ${segment.index+1}/3`,detail:`${chosenModel} · 영상 ${segment.from}~${segment.to}초 발언을 확인합니다. 무료 요청 ${providerCalls}회차입니다.`});
     try{
-      const req=makeSpeechClipRequest(video.url,outcome.segment);
-      const output=await interaction({key,model,requestId,pass:`speech-clip-${outcome.segment.index}`,input:req,format:clipSpeechFormat,signal,timeoutMs:85000,thinkingLevel:'low',maxOutputTokens:4800});
-      outcome.parsed=output.parsed;
-      delete outcome.failure;
-      consecutiveBusy=0;
-      console.info(JSON.stringify({event:'analysis.speech_clip_retry_succeeded',requestId,index:outcome.segment.index}));
+      const req=makeSpeechClipRequest(video.url,segment);
+      const output=await interaction({key,model:chosenModel,requestId,pass:`speech-clip-${segment.index}`,input:req,format:clipSpeechFormat,signal,timeoutMs,thinkingLevel:'low',maxOutputTokens:4800});
+      return {segment,parsed:output.parsed};
     }catch(err){
       if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
       const code=err instanceof ServiceError?err.code:'PROVIDER_UNAVAILABLE';
-      outcome.failure=code;
-      if(code==='PROVIDER_BUSY')consecutiveBusy++;
-      console.warn(JSON.stringify({event:'analysis.speech_clip_retry_failed',requestId,index:outcome.segment.index,code,consecutiveBusy}));
-      if(code==='FREE_LIMIT')break;
+      console.warn(JSON.stringify({event:'analysis.speech_clip_failed',requestId,index:segment.index,from:segment.from,to:segment.to,model:chosenModel,code}));
+      return {segment,failure:code};
     }
   }
+
+  const probe=await requestClip(ordered[0],model,SPEECH_PROBE_TIMEOUT_MS);
+  outcomes.push(probe);
+  if(probe.failure && shouldTryFreeModelFallback(probe.failure)){
+    // The only alternative is explicitly present in the existing free-tier
+    // allowlist. If the alternative also fails, fail fast with the real code.
+    const other=FREE_MODELS.find(item=>item.id!==model)?.id;
+    if(other){
+      console.warn(JSON.stringify({event:'analysis.speech_free_model_fallback',requestId,from:model,to:other,reason:probe.failure}));
+      onProgress({type:'progress',step:2,label:'다른 무료 Gemini 모델 확인',detail:`${model} 영상 요청 실패(${probe.failure}). ${other} 무료 모델로 마지막 연결 확인을 시도합니다. 유료 모델은 사용하지 않습니다.`});
+      try{await waitBeforeProviderRetry(signal,SPEECH_FALLBACK_WAIT_MS);}
+      catch{throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);}
+      const alternate=await requestClip(ordered[0],other,SPEECH_PROBE_TIMEOUT_MS);
+      if(!alternate.failure){
+        activeModel=other;
+        outcomes.splice(0,1,alternate);
+        console.info(JSON.stringify({event:'analysis.speech_free_model_fallback_succeeded',requestId,model:activeModel}));
+      }else{
+        outcomes.push(alternate);
+        console.warn(JSON.stringify({event:'analysis.speech_outage_fast_stop',requestId,models:[model,other],codes:[probe.failure,alternate.failure],providerCalls}));
+      }
+    }
+  }
+
+  // A failed probe means we have no verified speech source. In particular,
+  // do NOT launch the two additional clips or repeat an unavailable model.
+  if(outcomes[0]?.failure){
+    const code=speechClipFailureCode(outcomes);
+    throw new ServiceError(code,speechClipFailureMessage(code),code==='FREE_LIMIT'?429:code==='PROVIDER_BUSY'?503:code==='TIMEOUT'?504:502);
+  }
+
+  // Only after a successful real video response do we ask for both remaining
+  // windows. A provider returning lines:[] is not proof of silent audio.
+  const rest=await Promise.all(ordered.slice(1).map(segment=>requestClip(segment,activeModel,SPEECH_CLIP_TIMEOUT_MS)));
+  outcomes.push(...rest);
   const merged=collectSpeechClipResults(outcomes,segments);
   const source=speechSource(merged.lines,video.durationSeconds);
-  console.info(JSON.stringify({event:'analysis.speech_clip_coverage',requestId,coveredSegments:merged.coveredSegments,failedSegments:merged.failedSegments,missingWindows:merged.missingWindows,lines:merged.lines.length,rejected:merged.rejected,lastEnd:merged.lines.at(-1)?.endSeconds??null,providerCalls}));
+  console.info(JSON.stringify({event:'analysis.speech_clip_coverage',requestId,model:activeModel,coveredSegments:merged.coveredSegments,failedSegments:merged.failedSegments,missingWindows:merged.missingWindows,lines:merged.lines.length,rejected:merged.rejected,lastEnd:merged.lines.at(-1)?.endSeconds??null,providerCalls}));
   if(!source.claims.length){
     const code=speechClipFailureCode(outcomes);
-    const messageByCode:Record<typeof code,string>={
-      FREE_LIMIT:'Gemini 무료 API 할당량에 도달하여 발언을 확보하지 못했습니다. 추가 API 호출을 중단했습니다.',
-      GOOGLE_REQUEST_REJECTED:'Gemini가 영상 분석 요청을 거절했습니다. API 키·모델 지원 여부·영상 접근 권한을 확인해주세요.',
-      PROVIDER_BUSY:'Google Gemini 영상 분석 서버가 혼잡하여 HTTP 503 오류가 반복됐습니다. 잠시 후 다시 분석해주세요. 이번 요청에서 음성이 없다고 판단한 것은 아닙니다.',
-      TIMEOUT:'Gemini 음성 추출 시간이 초과되어 발언을 확보하지 못했습니다. 잠시 후 다시 분석해주세요.',
-      PROVIDER_UNAVAILABLE:'Gemini 음성 추출 요청이 실패하여 발언을 확인할 수 없었습니다. 터미널의 요청 ID와 오류 코드를 확인해주세요.',
-      INVALID_RESULT:'Gemini 응답에서 검증 가능한 발언을 확보하지 못했습니다. 빈 결과를 임의로 채우지 않습니다.',
-    };
-    throw new ServiceError(code,messageByCode[code],code==='FREE_LIMIT'?429:code==='PROVIDER_BUSY'?503:code==='TIMEOUT'?504:502);
+    throw new ServiceError(code,speechClipFailureMessage(code),code==='FREE_LIMIT'?429:code==='PROVIDER_BUSY'?503:code==='TIMEOUT'?504:502);
   }
   let content=fallbackFromSource(source);
   let composeOk=false;
-  // Compose text from the separately obtained utterances, not from the video.
   if(!outcomes.some(o=>o.failure==='FREE_LIMIT')){
     onProgress({type:'progress',step:3,label:'발언 기반 문서 작성',detail:`확보한 발언 ${source.claims.length}개로 요약·아티클을 작성합니다. 발언 문장과 시각은 변경하지 않습니다.`});
     providerCalls++;
     try{
-      const composed=await interaction({key,model,requestId,pass:'speech-compose',input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],format:composedResponseFormat,signal,timeoutMs:75000,thinkingLevel:'low',maxOutputTokens:6500});
+      const composed=await interaction({key,model:activeModel,requestId,pass:'speech-compose',input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],format:composedResponseFormat,signal,timeoutMs:75000,thinkingLevel:'low',maxOutputTokens:6500});
       const parsed=extractComposedContent(composed.parsed,source);
       content={...parsed};composeOk=true;
     }catch(error){
@@ -406,8 +404,8 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
       console.warn(JSON.stringify({event:'analysis.speech_compose_failed',requestId,code:error instanceof ServiceError?error.code:'UNKNOWN'}));
     }
   }
-  // The timeline is always the collected utterance, never the editorial timeline.
-  // Source.kind='audio' and sourceMode='video-url': these are AI estimates, NOT verified captions.
+  // The timeline always comes from the obtained utterances. AI timecodes
+  // remain unverified until checked against the actual video or timed captions.
   const mapped=speechFirstTimeline(merged.lines,source.evidence,video.durationSeconds);
   content.timeline=mapped.timeline;
   content.transcript=merged.lines;
@@ -415,13 +413,15 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   content.exclusions=content.exclusions.filter(x=>!/(마지막 원문 근거 종료|발화 없음|영상의 일부 발언 구간)/.test(x));
   if(missing)content.exclusions.push(`발언을 확인하지 못한 시간 구간: ${missing}. 확인되지 않은 발언과 시각은 생성하지 않았습니다.`);
   if(!composeOk)content.exclusions.push('발언 문서 작성에 실패해 검증 전 발언 메모만 표시합니다.');
-  const result=recordFromContent(video,model,mapped.evidence,content);
+  if(activeModel!==model)content.exclusions.push(`선택된 ${model} 모델의 제공자 오류로 허용된 다른 무료 모델(${activeModel})을 사용했습니다. 모델별 전사 품질이 다를 수 있으므로 원본과 대조해주세요.`);
+  const result=recordFromContent(video,activeModel,mapped.evidence,content);
   const partial=Boolean(merged.missingWindows.length)||!composeOk;
   result.analysisMeta={depth:'standard',videoProcessing:'static',elapsedMs:Date.now()-started,providerCalls,refinement:composeOk?'not-needed':'kept-first',pipeline:'single-pass',sourceMode:'video-url',qualityStatus:partial?'partial':'review',sourceEndPercent:merged.lines.length?(merged.lines.at(-1)!.endSeconds/video.durationSeconds*100):0};
   onProgress({type:'progress',step:4,label:partial?'구간별 발언 일부 확인':'구간별 발언 수집 완료',detail:partial?'확인하지 못한 구간은 표기하고 원문을 임의로 채우지 않았습니다.':'세 구간의 발언 원문을 취합했습니다. 시각은 영상으로 최종 대조해주세요.'});
-  console.info(JSON.stringify({event:'analysis.completed',requestId,model,mode:'speech-focused',providerCalls,lines:merged.lines.length,missingWindows:merged.missingWindows,composeOk,elapsedMs:Date.now()-started}));
+  console.info(JSON.stringify({event:'analysis.completed',requestId,model:activeModel,mode:'speech-focused',providerCalls,lines:merged.lines.length,missingWindows:merged.missingWindows,composeOk,elapsedMs:Date.now()-started}));
   return result;
 }
+
 export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(event:AnalysisProgress)=>void,signal?:AbortSignal,depth:'standard'|'deep'='standard',model:FreeModelId=FREE_MODEL,captionText?:string,processingPreference:VideoProcessingPreference='auto',retryOnBusy=true,recoverMissingSpeech=false,segmentShortSpeech=true,autoSpeech=false):Promise<AnalysisRecord>{
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new ServiceError('NOT_CONFIGURED','Google AI Studio 무료 등급 API 키가 필요합니다.',503);

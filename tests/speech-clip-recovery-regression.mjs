@@ -1,47 +1,41 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
 import ts from 'typescript';
-
+import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-const read=(p)=>fs.readFileSync(path.join(root,p),'utf8');
-const transpile=(filename)=>{
-  const transpiled=ts.transpileModule(read(filename),{
-    fileName:filename,
-    compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022},
-    reportDiagnostics:true,
-  });
-  assert.equal(transpiled.diagnostics?.length??0,0,`Invalid TypeScript in ${filename}`);
-  return transpiled.outputText;
-};
-const retry={};
-Function('exports',transpile('lib/provider-retry.ts'))(retry);
-const recovery={};
-Function('exports','require',transpile('lib/speech-clip-recovery.ts'))(recovery,(name)=>{
-  assert.equal(name,'./provider-retry');
-  return retry;
-});
-const {speechClipFailureCode,speechClipRetryDelayMs}=recovery;
-assert.equal(speechClipRetryDelayMs('PROVIDER_BUSY',0),2400);
-assert.equal(speechClipRetryDelayMs('PROVIDER_BUSY',1),4800);
-assert.equal(speechClipRetryDelayMs('PROVIDER_BUSY',2),null);
-for(const blocked of ['FREE_LIMIT','TIMEOUT','TEMPORARY_HTTP','INVALID_RESULT',undefined]){
-  assert.equal(speechClipRetryDelayMs(blocked,0),null,`No retry for ${blocked}`);
+const read=(f)=>fs.readFileSync(path.join(root,f),'utf8');
+const code=ts.transpileModule(read('lib/speech-clip-recovery.ts'),{fileName:'speech-clip-recovery.ts',compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS},reportDiagnostics:true});
+assert.equal(code.diagnostics?.length??0,0,'Recovery policy must transpile');
+const p={};Function('exports',code.outputText)(p);
+assert.equal(p.SPEECH_PROBE_TIMEOUT_MS,45000);
+assert.equal(p.SPEECH_CLIP_TIMEOUT_MS,65000);
+assert.equal(p.SPEECH_FALLBACK_WAIT_MS,1600);
+assert(p.shouldTryFreeModelFallback('PROVIDER_BUSY'));
+assert(p.shouldTryFreeModelFallback('TIMEOUT'));
+for(const blocked of ['FREE_LIMIT','GOOGLE_REQUEST_REJECTED','INVALID_RESULT','TEMPORARY_HTTP',undefined]){
+  assert.equal(p.shouldTryFreeModelFallback(blocked),false,`No fallback on ${blocked}`);
 }
-assert.equal(speechClipFailureCode([{failure:'PROVIDER_BUSY'},{failure:'PROVIDER_BUSY'},{failure:'PROVIDER_BUSY'}]),'PROVIDER_BUSY');
-assert.equal(speechClipFailureCode([{failure:'PROVIDER_BUSY'},{failure:'FREE_LIMIT'}]),'FREE_LIMIT');
-assert.equal(speechClipFailureCode([{failure:'GOOGLE_REQUEST_REJECTED'},{failure:'PROVIDER_BUSY'}]),'GOOGLE_REQUEST_REJECTED');
-assert.equal(speechClipFailureCode([{failure:'TIMEOUT'},{failure:'INVALID_RESULT'}]),'TIMEOUT');
-assert.equal(speechClipFailureCode([{failure:'TEMPORARY_HTTP'}]),'PROVIDER_UNAVAILABLE');
-assert.equal(speechClipFailureCode([{failure:'INVALID_RESULT'}]),'PROVIDER_UNAVAILABLE');
-assert.equal(speechClipFailureCode([{parsed:{lines:[]}}]),'INVALID_RESULT');
+assert.equal(p.speechClipFailureCode([{failure:'PROVIDER_BUSY'},{failure:'TIMEOUT'}]),'PROVIDER_BUSY');
+assert.equal(p.speechClipFailureCode([{failure:'FREE_LIMIT'},{failure:'PROVIDER_BUSY'}]),'FREE_LIMIT');
+assert.equal(p.speechClipFailureCode([{failure:'GOOGLE_REQUEST_REJECTED'}]),'GOOGLE_REQUEST_REJECTED');
+assert.equal(p.speechClipFailureCode([{failure:'TIMEOUT'}]),'TIMEOUT');
+assert.equal(p.speechClipFailureCode([{parsed:{lines:[]}}]),'INVALID_RESULT');
+
+const ui=read('components/analysis-workspace.tsx');
+assert(!ui.includes('원클릭 무료 Gemini 자동 분석'));
+assert(!ui.includes('라이브위키는 공개 설명상 자막 중심으로 요약합니다'));
+assert(!ui.includes('>중요 안내</p>'));
+assert.match(ui,/분석을 완료하지 못했습니다/,'Actual error state must remain visible');
+assert.match(ui,/다시 분석 \(무료 요청\)/,'Manual retry stays functional');
 const ai=read('lib/server/ai.ts');
-assert.match(ai,/speechClipFailureCode\(outcomes\)/,'Empty clip results must preserve upstream error');
-assert.match(ai,/speechClipRetryDelayMs\(outcome\.failure,consecutiveBusy\)/,'Only failed busy clips get bounded recovery');
-assert.match(ai,/event:'analysis\.speech_clip_retry'/,'Log retry with request correlation');
-assert.match(ai,/event:'analysis\.speech_clip_retry_failed'/,'Log retry failure without leaking provider body');
-assert.match(ai,/waitBeforeProviderRetry\(signal,delayMs\)/,'Backoff must be cancellable');
-assert.match(ai,/pass:`speech-clip-\$\{outcome\.segment\.index\}`/,'Retry original clip and original time offsets');
-assert.match(ai,/if\(!source\.claims\.length\)/,'Never fabricate speech after total provider failure');
-console.log('PASS: short speech clips 503 bounded sequential recovery; 429 hard stop; truthful upstream failure');
+assert.match(ai,/speechClipFailureCode\(outcomes\)/);
+assert.match(ai,/shouldTryFreeModelFallback\(probe\.failure\)/);
+assert.match(ai,/FREE_MODELS\.find\(item=>item\.id!==model\)/);
+assert.match(ai,/event:'analysis\.speech_outage_fast_stop'/);
+assert.match(ai,/const probe=await requestClip\(ordered\[0\],model,SPEECH_PROBE_TIMEOUT_MS\)/);
+assert.match(ai,/if\(outcomes\[0\]\?\.failure\)/);
+assert.match(ai,/ordered\.slice\(1\)\.map\(segment=>requestClip\(segment,activeModel,SPEECH_CLIP_TIMEOUT_MS\)\)/);
+assert.match(ai,/const result=recordFromContent\(video,activeModel,mapped\.evidence,content\)/);
+assert.doesNotMatch(ai,/speechClipRetryDelayMs\(/,'No repetitive same-model 503 retries in short-video path');
+console.log('PASS: two UI notices removed; real errors visible; fail-fast free-model probe and bounded provider requests');
