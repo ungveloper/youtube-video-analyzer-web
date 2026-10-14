@@ -60,6 +60,6 @@ assert.match(server,/redirect:'error'/);
 assert.match(ai,/fetchPublicKoreanCaptions\(video\.id,video\.durationSeconds,signal\)/);
 assert.match(ai,/result\.analysisMeta\.sourceMode='public-captions'/);
 assert.match(ai,/start_offset:`\$\{Math\.floor\(recoveryWindow\[0\]\.from\)\}s`/);
-assert.match(ui,/useState\(false\);\s*const \[segmentShortSpeech,setSegmentShortSpeech\]=useState\(false\);\s*const \[captionText/);
+assert.match(ui,/const recoverMissingSpeech=false;\s*const segmentShortSpeech=false;/,'automatic path disables extra recovery calls and batching');
 assert.match(api,/body\.recoverMissingSpeech===undefined \? false/);
 console.log('PASS: public Korean time-coded subtitles, unsafe URL rejection, 3:22 whole-span coverage, text-first processing and quota-conscious default');

@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import ts from 'typescript';
+import {fileURLToPath} from 'node:url';
+
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const source=fs.readFileSync(path.join(root,'components/analysis-workspace.tsx'),'utf8');
+const parsed=ts.createSourceFile('analysis-workspace.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
+assert.equal(parsed.parseDiagnostics.length,0,'Workspace must parse as TSX');
+const component=parsed.statements.find(s=>ts.isFunctionDeclaration(s)&&s.name?.text==='AnalysisWorkspace');
+assert(component?.body,'Expected AnalysisWorkspace component function');
+const renders=component.body.statements.filter(s=>ts.isReturnStatement(s));
+assert.equal(renders.length,1,'Exactly one top-level component render');
+const render=renders[0].getText(parsed);
+assert.doesNotMatch(render,/autoStarted\.current/,'Do not read mutable auto-start refs in React render');
+assert.match(render,/autoAnalyze\s*&&\s*!autoAttempted/,'Render auto-start pending message from state');
+assert.match(render,/!\(autoAnalyze\s*&&\s*!autoAttempted\s*&&\s*phase==='ready'\)/,'Render automatic-start button gating from state');
+assert.match(source,/const \[autoAttempted,setAutoAttempted\]\s*=\s*useState\(false\)/,'Use React state for render-sensitive UI');
+assert.match(source,/autoStarted\.current=true;\s*setAutoAttempted\(true\);\s*void begin\(\);/,'Mark the attempt before starting; keep ref dedupe outside render');
+assert.match(source,/window\.setTimeout\(\(\)=>/,'Auto-start must remain deferred to avoid synchronous effect state changes');
+assert.match(source,/window\.clearTimeout\(startTimer\)/,'Cancelled effect must not initiate automatic request');
+console.log('PASS: no React ref read during render; state-driven ready UI, recoverable retry, deferred one-shot auto-start');

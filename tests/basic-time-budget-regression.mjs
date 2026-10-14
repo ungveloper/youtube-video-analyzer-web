@@ -21,8 +21,8 @@ assert.equal(hasBasic503RetryBudget(90000,77000),false,'503 after 77s must not t
 const ui=read('components/analysis-workspace.tsx');
 const route=read('app/api/analyze/route.ts');
 const ai=read('lib/server/ai.ts');
-assert.match(ui,/\[retryOnBusy,setRetryOnBusy\]=useState\(false\)/);
-assert.match(ui,/\[segmentShortSpeech,setSegmentShortSpeech\]=useState\(false\)/);
+assert.match(ui,/const retryOnBusy=false;/,'503 retries remain disabled in one-click mode');
+assert.match(ui,/const segmentShortSpeech=false;/,'experimental multiple-video batching stays disabled');
 assert.match(route,/body\.retryOnBusy === undefined \? false/);
 assert.match(route,/body\.segmentShortSpeech===undefined \? false/);
 assert.match(ai,/const basicDeadlineMs=Date\.now\(\)\+firstTimeoutMs/);

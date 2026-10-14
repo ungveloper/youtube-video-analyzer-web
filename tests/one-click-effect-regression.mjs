@@ -22,7 +22,7 @@ assert(ts.isArrowFunction(effectCallback)&&ts.isBlock(effectCallback.body),'Expe
 const effectText=effectCallback.body.getText(parsed);
 assert.match(effectText,/window\.setTimeout\s*\(/,'Schedule the start after the React effect');
 assert.match(effectText,/window\.clearTimeout\s*\(\s*startTimer\s*\)/,'Cancel the queued start during cleanup/Strict Mode');
-assert.match(effectText,/if\s*\(\s*autoStarted\.current\s*\)\s*return/,'Prevent duplicate starts');
+assert.match(effectText,/if\s*\(\s*autoStarted\.current\s*\|\|\s*requestController\.current\s*\)\s*return/,'Prevent duplicate starts');
 assert.match(effectText,/autoStarted\.current\s*=\s*true/,'Consume the start flag only when starting');
 assert.match(effectText,/void\s+begin\s*\(\s*\)/,'The queued callback must initiate analysis');
 for(const statement of effectCallback.body.statements){
@@ -30,5 +30,6 @@ for(const statement of effectCallback.body.statements){
   assert(!/^void\s+begin\s*\(/.test(direct),'Never invoke the state-changing begin() directly from the effect');
 }
 assert.match(form,/router\.push\(`\/analyze\/\$\{id\}\?start=1`\)/,'Keep one-click home-to-analysis routing');
-assert.match(workspace,/get\('start'\)\s*!==\s*'1'/,'Retain the URL activation flag');
-console.log('PASS: one-click auto analysis queued outside effect; cleanup cancels Strict Mode timer; no synchronous state update; original home navigation retained');
+assert.match(workspace,/autoAnalyze/,'Use server-provided home-page start signal');
+assert.match(workspace,/if\(!autoAnalyze \|\| autoStarted\.current/,'Use the explicit one-click activation signal');
+console.log('PASS: one-click auto analysis queued outside effect; cleanup cancels Strict Mode timer; no synchronous state update; server-provided home navigation retained');

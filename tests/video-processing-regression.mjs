@@ -32,6 +32,6 @@ assert.match(ai,/const attempts=retryOnBusy\?/);
 assert.match(ai,/shouldRetryProviderBusy/);
 assert.match(route,/analysis\.timing/);
 assert.match(route,/isVideoProcessingPreference\(processingPreference\)/);
-assert.match(ui,/<option value="static">Static/);
-assert.match(ui,/<option value="agentic">Agentic/);
+assert.match(ui,/const videoProcessing='auto' as const;/);
+assert.doesNotMatch(ui,/<option value="agentic">Agentic/,'No processing-type selection step');
 console.log('PASS: video processing auto/manual decisions, validation, logging and fast single-call invariants');

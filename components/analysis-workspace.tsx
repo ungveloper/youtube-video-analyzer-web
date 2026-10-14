@@ -5,14 +5,11 @@ import { toast } from 'sonner';
 import { Badge,Button,Card,Tabs } from '@/components/ui/primitives';
 import { DetailedAnalysisList } from '@/components/detailed-analysis-list';
 import { YouTubePlayerEmbed } from '@/components/youtube-player';
-import { CaptionInputPanel } from '@/components/caption-input-panel';
-import { parseTimedCaptions } from '@/lib/caption-input';
 import {assessTimelineTiming, parseTimelineTime, timelineStartSeconds} from '@/lib/timeline-accuracy';
 import {timelineTime} from '@/lib/timeline-granularity';
 import type { YouTubePlayerHandle } from '@/components/youtube-player';
 import { assessDetail } from '@/lib/analysis-detail';
-import { FREE_MODELS, FREE_MODEL, type FreeModelId } from '@/lib/free-models';
-import {resolveVideoProcessing, type VideoProcessingPreference} from '@/lib/video-processing';
+import { FREE_MODEL } from '@/lib/free-models';
 import { exportDocx,exportPdf,exportText,setEdited,toMarkdown } from '@/lib/exporters';
 import { extractVideoId,timestamp } from '@/lib/youtube';
 import { readAnalysisEvents,stagePercent } from '@/lib/analysis-stream';
@@ -20,7 +17,7 @@ import type { AnalysisProgress } from '@/lib/analysis-stream';
 import type { AnalysisContent,AnalysisRecord, ApiError,QuotaInfo,VideoInfo } from '@/lib/types';
 const tabs=[{value:'summary',label:'요약'},{value:'timeline',label:'타임라인'},{value:'article',label:'아티클'},{value:'transcript',label:'스크립트'}];
 type Tab='summary'|'timeline'|'article'|'transcript';
-export function AnalysisWorkspace({videoId}:{videoId:string}){
+export function AnalysisWorkspace({videoId,autoAnalyze=false}:{videoId:string;autoAnalyze?:boolean}){
   const valid=extractVideoId(videoId)===videoId;
   const [video,setVideo]=useState<VideoInfo|null>(null);
   const [record,setRecord]=useState<AnalysisRecord|null>(null);
@@ -29,23 +26,22 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   const [tab,setTab]=useState<Tab>('summary');const [editing,setEditing]=useState(false);
   const [quota,setQuota]=useState<QuotaInfo|null>(null);const [busyExport,setBusyExport]=useState(false);
   const playerRef=useRef<YouTubePlayerHandle|null>(null);
-  const [depth,setDepth]=useState<'standard'|'deep'>('standard');
-  const [model,setModel]=useState<FreeModelId>(FREE_MODEL);
-  const [videoProcessing,setVideoProcessing]=useState<VideoProcessingPreference>('auto');
-  const [retryOnBusy,setRetryOnBusy]=useState(false);
-  const [recoverMissingSpeech,setRecoverMissingSpeech]=useState(false);
-  const [segmentShortSpeech,setSegmentShortSpeech]=useState(false);
-  const [captionText,setCaptionText]=useState('');
-  const captionCheck=useMemo(()=>{if(!captionText.trim())return true;if(!video)return false;try{parseTimedCaptions(captionText,video.durationSeconds);return true;}catch{return false;}},[captionText,video]);
+  // Safe fixed defaults: the user starts analysis once on the homepage.
+  const model=FREE_MODEL;
+  const depth='standard' as const;
+  const videoProcessing='auto' as const;
+  const retryOnBusy=false;
+  const recoverMissingSpeech=false;
+  const segmentShortSpeech=false;
+
   const [notice,setNotice]=useState('');
   const [progress,setProgress]=useState<AnalysisProgress|null>(null);
   const [elapsed,setElapsed]=useState(0);
   const [startedAt,setStartedAt]=useState<number|null>(null);
   const [failure,setFailure]=useState('');
-  const [diagnostic,setDiagnostic]=useState('');
-  const [diagnosticBusy,setDiagnosticBusy]=useState(false);
   const requestController=useRef<AbortController|null>(null);
   const autoStarted=useRef(false);
+  const [autoAttempted,setAutoAttempted]=useState(false);
   useEffect(()=>{
     if(startedAt===null)return;
     const timer=setInterval(()=>setElapsed(Math.floor((Date.now()-startedAt)/1000)),1000);
@@ -53,16 +49,6 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   },[startedAt]);
   useEffect(()=>{const controllerRef=requestController;return()=>controllerRef.current?.abort();},[]);
   const stop=()=>{requestController.current?.abort();};
-  async function diagnose() {
-    setDiagnosticBusy(true);setDiagnostic('Gemini 모델 정보를 조회하고 있습니다…');
-    try {
-      const response=await fetch(`/api/ai-diagnostics?model=${encodeURIComponent(model)}`,{cache:'no-store'});
-      const data=await response.json() as {ok?:boolean;model?:string;message?:string;httpStatus?:number};
-      setDiagnostic(`${data.ok?'모델 정보 조회 성공':'모델 정보 조회 실패'} · ${data.model||'Gemini'} · ${data.message||`HTTP ${data.httpStatus||response.status}`}`);
-      if(data.ok)toast.success('Gemini 모델 연결 진단 성공');else toast.error('모델 연결 진단 실패', {description:data.message||'모델 설정을 확인해주세요.'});
-    } catch {setDiagnostic('진단 서버에 연결할 수 없습니다. 개발 서버를 재시작해주세요.');toast.error('진단 서버 연결에 실패했습니다.');}
-    finally {setDiagnosticBusy(false);}
-  }
   const loadQuota=useCallback(async()=>{try{const r=await fetch('/api/quota',{cache:'no-store'});const q=await r.json() as QuotaInfo;setQuota(q);}catch{setQuota(null);}},[]);
   useEffect(()=>{if(!valid)return;let active=true;async function init(){try{
     const response=await fetch(`/api/video?id=${videoId}`,{cache:'no-store'});
@@ -74,8 +60,7 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
   void init();return()=>{active=false};},[videoId,valid,loadQuota]);
   const seek=useCallback((time:number)=>{playerRef.current?.seekAndPlay(time);},[]);
   async function begin(){
-    if(!video||phase==='processing')return;
-    if(!captionCheck){toast.warning('자막의 시간 형식을 확인해주세요.');return;}
+    if(!video||phase==='processing'||requestController.current)return;
     if(record&&!confirm(`기존 분석 결과를 새 결과로 교체합니다. 공개 자막이 없는 2~5분 영상은 발언 추출 3회와 문서 작성 1회 등 무료 Gemini API 호출을 최대 4회 사용합니다. 유료 모델로 전환하지 않습니다. 필요한 결과를 다운로드하셨나요?`))return;
     const controller=new AbortController();requestController.current=controller;
     const requestId=crypto.randomUUID();
@@ -85,7 +70,7 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
     // Analysis has a dedicated progress panel; avoid a second loading/error notification.
     toast.dismiss('yva-analysis');
     try{
-      const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({videoId:video.id,requestId,depth:captionText.trim()?'deep':depth,model,videoProcessing,retryOnBusy,recoverMissingSpeech,segmentShortSpeech,autoSpeech:true,captionText:captionText.trim()||undefined}),signal:controller.signal,cache:'no-store'});
+      const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({videoId:video.id,requestId,depth,model,videoProcessing,retryOnBusy,recoverMissingSpeech,segmentShortSpeech,autoSpeech:true}),signal:controller.signal,cache:'no-store'});
       const result=await readAnalysisEvents(res,event=>{
         if(controller.signal.aborted)return;
         setProgress(event);
@@ -103,25 +88,28 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
       await loadQuota();
     }finally{
       if(requestController.current===controller)requestController.current=null;
+      // Do not mutate Next's active route while its streamed analysis is running.
+      // Clear the one-click query only after the initial attempt has ended.
+      if(autoAnalyze && new URLSearchParams(window.location.search).get('start')==='1'){
+        window.history.replaceState(window.history.state,'',window.location.pathname);
+      }
       setStartedAt(null);
     }
   }
 
   useEffect(()=>{
-    if(autoStarted.current || phase!=='ready' || !video || quota?.enabled!==true) return;
-    if(new URLSearchParams(window.location.search).get('start')!=='1') return;
-    // Run only after the effect has finished. React forbids synchronous state
-    // updates from effects, and cancelling the timer avoids Strict Mode double runs.
+    if(!autoAnalyze || autoStarted.current || phase!=='ready' || !video) return;
+    // The explicit home-page action is authoritative. Quota status is informational;
+    // the /api/analyze server route enforces the personal Free Tier configuration.
     const startTimer=window.setTimeout(()=>{
-      if(autoStarted.current) return;
+      if(autoStarted.current || requestController.current) return;
       autoStarted.current=true;
-      window.history.replaceState(window.history.state,'',window.location.pathname);
+      setAutoAttempted(true);
       void begin();
     },0);
-    return ()=>window.clearTimeout(startTimer);
-    // The automatic first attempt is tied to the URL and metadata/quota readiness.
+    return()=>window.clearTimeout(startTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[video,phase,quota?.enabled]);
+  },[autoAnalyze,video,phase]);
 
   const changed=record?JSON.stringify(record.original)!==JSON.stringify(record.edited):false;
   function changeItem(target:Tab,id:string,text:string){setRecord(prev=>prev?{...prev,updatedAt:new Date().toISOString(),edited:setEdited(prev.edited,target,id,text)}:prev);setNotice('현재 화면에 편집 내용 반영됨 · 다운로드해야 보관됩니다.');}
@@ -152,32 +140,25 @@ export function AnalysisWorkspace({videoId}:{videoId:string}){
         <Card className="overflow-hidden">{valid?<YouTubePlayerEmbed ref={playerRef} videoId={videoId} durationSeconds={video?.durationSeconds}/>:<p className="p-6">잘못된 영상 ID</p>}<div className="p-5"><h2 className="font-semibold leading-7">{video?.title||'영상 정보를 확인하는 중입니다'}</h2><p className="mt-1 text-sm text-slate-400">{video?.channel||'YouTube'} {video?.durationSeconds?`· ${timestamp(video.durationSeconds)}`:''}</p><a className="mt-3 inline-block text-xs text-indigo-300 hover:underline" href={`https://www.youtube.com/watch?v=${videoId}`} target="_blank" rel="noopener noreferrer">YouTube에서 원본 보기 ↗</a></div></Card>
         <Card className="p-5"><div className="flex items-center justify-between gap-2"><h3 className="font-semibold">분석 상태</h3><Badge>{failure?'오류':phase==='completed'&&record?.analysisMeta?.qualityStatus==='partial'?'부분 분석':({checking:'조회 중',ready:'준비',processing:'분석 중',completed:'완료',error:'오류'})[phase]}</Badge></div>
         {failure&&<div role="alert" className="mt-3 rounded-xl border border-rose-700/50 bg-rose-950/30 px-3 py-3 text-sm leading-6 text-rose-200"><strong className="block font-semibold">분석을 완료하지 못했습니다</strong>{failure}</div>}
-        {!failure&&<p role="status" className="mt-3 text-sm leading-7 text-slate-400">{message||(phase==='completed'?'분석 결과를 현재 화면에서 확인할 수 있습니다. 이동·새로고침 시 사라지므로 다운로드하세요.':phase==='ready'?'공개 영상을 확인했습니다. 무료 Gemini API 설정이 활성화되면 시작할 수 있습니다.':'입력 자료와 서버 설정을 확인합니다.')}</p>}
+        {!failure&&<p role="status" className="mt-3 text-sm leading-7 text-slate-400">{message||(phase==='completed'?'분석 결과를 현재 화면에서 확인할 수 있습니다. 이동·새로고침 시 사라지므로 다운로드하세요.':phase==='ready'?(autoAnalyze&&!autoAttempted?'영상 확인 완료 · AI 분석을 자동으로 시작합니다.':'영상 정보를 확인했습니다. 분석 시작 버튼을 눌러주세요.'):'입력 자료와 서버 설정을 확인합니다.')}</p>}
         {phase==='processing'&&<div className="mt-4 space-y-3" aria-live="polite">
           <div className="flex items-center gap-3"><span aria-hidden="true" className="inline-block h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-indigo-300/25 border-t-indigo-300"/><div className="min-w-0 flex-1"><p className="text-sm font-medium text-indigo-100">{progress?.label||'분석 준비 중'}</p><p className="mt-1 text-xs text-slate-400">경과 {Math.floor(elapsed/60)}분 {String(elapsed%60).padStart(2,'0')}초 {progress?.attempt?`· API 요청 ${progress.attempt}회차`:''}</p></div><span className="text-sm font-semibold tabular-nums text-indigo-200">{stagePercent(progress?.step??0)}%</span></div>
           <div className="h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="분석 작업 단계 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={stagePercent(progress?.step??0)}><div className="h-full rounded-full bg-indigo-500 transition-[width] duration-500" style={{width:`${stagePercent(progress?.step??0)}%`}}/></div>
           <p className="text-xs leading-5 text-slate-500">표시된 %는 영상 확인·응답 수신 등 완료된 <strong>작업 단계 기준</strong>입니다. Gemini 내부 분석률은 확인할 수 없으며 분석 중 수치가 유지될 수 있습니다.</p>
           <Button type="button" variant="secondary" className="w-full" onClick={stop}>진행 중인 분석 중단</Button>
         </div>}
-        <div className="mt-4 space-y-2 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><label htmlFor="free-model-select" className="block text-xs font-semibold text-slate-200">무료 Gemini 모델</label><select id="free-model-select" value={model} disabled={phase==='processing'} onChange={e=>{setModel(e.target.value as FreeModelId);setDiagnostic('');}} className="w-full rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs text-slate-100">{FREE_MODELS.map(item=><option value={item.id} key={item.id}>{item.name}</option>)}</select><p className="text-xs leading-5 text-slate-500">짧은 영상은 자동으로 발언 3구간을 각각 확인한 뒤 문서를 작성하므로 최대 4회 무료 API 요청이 발생합니다. 선택한 모델의 Free Tier 사용 가능 여부는 AI Studio 프로젝트에서 확인해야 합니다. 유료 등급 키는 사용하지 마세요. 자동 유료 전환은 없습니다.</p></div>
-        <div className="mt-4 space-y-2 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><label htmlFor="video-processing" className="block text-xs font-semibold text-slate-200">영상 처리 방식</label><select id="video-processing" value={videoProcessing} onChange={e=>setVideoProcessing(e.target.value as VideoProcessingPreference)} disabled={phase==='processing'||!!captionText.trim()} className="w-full rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs text-slate-100"><option value="auto">자동 · 짧은 영상은 빠른 Static</option><option value="static">Static · 속도 우선</option><option value="agentic">Agentic · 깊은 탐색(시간 증가 가능)</option></select><p className="text-xs leading-5 text-slate-500">{captionText.trim()?'시간 지정 원문은 영상 재처리 없이 텍스트로 분석합니다.':`현재 선택: ${video?resolveVideoProcessing(video.durationSeconds,model,videoProcessing)==='static'?'Static':'Agentic':'영상 확인 후 자동 선택'} · Static 기본값입니다. 3구간 입력은 처리 시간이 길어질 수 있어 기본 해제했습니다. 시간 지정 자막이 없으면 AI 시각은 검증되지 않습니다.`}</p></div>
-        <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3 text-xs text-slate-200">
-          <input type="checkbox" className="mt-0.5 h-4 w-4 accent-indigo-500" checked={retryOnBusy} onChange={e=>setRetryOnBusy(e.target.checked)} disabled={phase==='processing'}/>
-          <span><strong className="block text-sm font-semibold">Google 503 발생 시 1회 재시도 (기본 꺼짐)</strong><span className="mt-1 block leading-5 text-slate-400">영상 URL 분석에서 503 발생 시 2.4초 대기 후 같은 무료 모델에 한 번만 재요청합니다. 무료 API 호출이 추가될 수 있습니다. 기본은 꺼짐이며, 켜더라도 기본 분석 전체 90초(긴 영상 120초) 예산을 초과해 재요청하지 않습니다. 429는 재시도하지 않습니다.</span></span>
-        </label>
-        <div className="mt-3 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><label className="flex items-center gap-2 text-xs font-semibold text-slate-200"><input type="checkbox" checked={segmentShortSpeech} disabled={phase==='processing'} onChange={event=>setSegmentShortSpeech(event.target.checked)} className="accent-indigo-500"/>짧은 영상 3구간 발언 추출 (실험)</label><p className="mt-1 text-xs leading-5 text-slate-500">공개 자막이 없는 2~5분 Static 영상은 3개의 시간 제한 클립을 하나의 Gemini 요청에 전달합니다. AI 추정 시각이며 정확한 녹취는 보장하지 않습니다. Google에서 구간 입력을 거절하거나 제한시간을 초과한 사례가 있어 기본 해제했습니다. 필요할 때만 직접 켜세요. 시간 정확도는 보장하지 않습니다.</p></div>
-        <div className="mt-3 rounded-xl border border-indigo-500/20 bg-slate-950/50 p-3"><label className="flex items-center gap-2 text-xs font-semibold text-slate-200"><input type="checkbox" checked={recoverMissingSpeech} disabled={phase==='processing'} onChange={event=>setRecoverMissingSpeech(event.target.checked)} className="accent-indigo-500"/>음성 공백 추가 AI 요청 (선택)</label><p className="mt-1 text-xs leading-5 text-slate-500">기본 분석은 먼저 공개 한국어 시간 지정 자막을 확인하며 Gemini 호출이 추가되지 않습니다. 자막이 없을 때 이 옵션을 켜면 누락 구간에 추가 영상 요청을 최대 1회 보냅니다. 기본값은 꺼짐(429 방지)입니다. 시간이 더 걸리고 무료 한도를 소모할 수 있으며, 실제 녹취·시각 정확성은 보증되지 않습니다.</p></div>
-        <CaptionInputPanel value={captionText} onChange={v=>{setCaptionText(v);if(v.trim())setDepth('deep');}} duration={video?.durationSeconds||0} disabled={phase==='processing'}/>
-        <Button className="mt-4 w-full" onClick={begin} disabled={!video||!captionCheck||phase==='processing'||phase==='checking'||phase==='error'||(quota?.enabled!==true)}>{phase==='processing'?<><span aria-hidden="true" className="mr-2 inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"/>분석 요청 처리 중…</>:record?'다시 분석 (무료 API 호출 가능)':'AI 분석 시작'}</Button>
-        <Button type="button" variant="secondary" className="mt-2 w-full" disabled={diagnosticBusy||phase==='processing'} onClick={diagnose}>{diagnosticBusy?'모델 연결 확인 중…':'무료 모델 연결 진단 (AI 분석 호출 없음)'}</Button>
-        {diagnostic&&<p role="status" className="mt-2 break-words rounded-lg border border-slate-700 bg-slate-950/60 p-3 text-xs leading-6 text-slate-300">{diagnostic}</p>}
+        <div className="mt-4 rounded-xl border border-slate-700 bg-slate-950/50 p-3">
+          <p className="text-xs font-semibold text-slate-200">원클릭 무료 Gemini 자동 분석</p>
+          <p className="mt-1 text-xs leading-5 text-slate-400">모델·분석 깊이·영상 방식 등 추가 설정 없이 요약·타임라인·아티클·스크립트를 생성합니다. 공개 자막이 없는 짧은 영상은 무료 Gemini 요청을 최대 4회 사용할 수 있습니다. 유료 모델로 전환하지 않습니다.</p>
+        </div>
+        {phase!=='processing'&&!(autoAnalyze&&!autoAttempted&&phase==='ready')&&<Button className="mt-4 w-full" onClick={begin} disabled={!video||phase==='checking'||phase==='error'}>{record?'다시 분석 (무료 요청)':'분석 시작'}</Button>}
         {record&&<p className="mt-3 text-xs text-slate-500">분석을 새로 시작하면 현재 결과가 교체됩니다. 필요한 내용은 먼저 다운로드해주세요.</p>}</Card>
         <Card className="p-5 text-xs leading-6 text-slate-400"><p className="font-semibold text-slate-200">중요 안내</p><p className="mt-2">AI 분석은 원본 내용을 완벽하게 보증하지 않습니다. 시간 근거는 반드시 영상을 재생해 확인하세요. 원문을 확보하지 못한 경우 스크립트를 만들지 않습니다.</p><p className="mt-2">라이브위키는 공개 설명상 자막 중심으로 요약합니다. 자막 없이 영상 URL만 분석하면 같은 상세도를 보장할 수 없습니다. 근거 참조율은 사실 정확도가 아닙니다.</p><p className="mt-2">브라우저를 닫으면 진행 중인 분석 결과가 유실될 수 있습니다.</p></Card>
       </div>
       <Card className="min-w-0 overflow-hidden"><div className="border-b border-slate-800 p-4 sm:p-5"><div className="flex flex-wrap items-center justify-between gap-2"><div><h2 className="font-semibold">분석 결과</h2><p className="mt-1 text-xs text-slate-500">한국어 · 근거 연결 · 상세 해설 · 저장 없음</p></div>{record&&<Badge>{changed?'사용자 편집본':'AI 원본'}</Badge>}</div>{record?.analysisMeta&&<p className="mt-2 text-xs text-slate-400">{record.analysisMeta.depth==='deep'?'정밀 분석':'기본 분석'} · {record.model} · 실제 무료 AI 호출 {record.analysisMeta.providerCalls}회{record.analysisMeta.composeRecovery==='article-only'?' · 아티클 전용 복구/보강(요약·타임라인은 일부 근거 메모)':record.analysisMeta.refinement==='improved'?' · 근거 추출 → 상세 문서 완성':record.analysisMeta.refinement==='kept-first'?' · 문서 생성 실패: 근거 요지만 제공':''}{record.analysisMeta.sourceClaims?` · 추출된 논점 ${record.analysisMeta.sourceClaims}개`:''}{record.analysisMeta.sourceMode==='user-captions'?' · 사용자 자막 기반':record.analysisMeta.sourceMode==='public-captions'?' · 공개 YouTube 자막 기반':''}{record.analysisMeta.videoProcessing?` · 입력: ${record.analysisMeta.videoProcessing}`:''}{typeof record.analysisMeta.elapsedMs==='number'?` · AI 처리 ${(record.analysisMeta.elapsedMs/1000).toFixed(1)}초`:''}{typeof record.analysisMeta.inputTokens==='number'?` · 입력 토큰 ${record.analysisMeta.inputTokens.toLocaleString('ko-KR')}`:''}{typeof record.analysisMeta.outputTokens==='number'?` · 출력 토큰 ${record.analysisMeta.outputTokens.toLocaleString('ko-KR')}`:''}{record.analysisMeta.qualityStatus==='partial'?' · 부분 분석(원본 확인 필요)':''}{typeof record.analysisMeta.coveragePercent==='number'?` · 근거 참조율 ${record.analysisMeta.coveragePercent}%`:''}</p>}{record?.analysisMeta?.qualityStatus==='partial'&&<div role="status" className="mt-3 space-y-1 rounded-lg border border-amber-600/40 bg-amber-950/20 px-3 py-3 text-xs leading-6 text-amber-200"><p className="font-semibold">발언 원문 또는 상세 문서의 일부가 누락됐습니다.</p><p>{record.analysisMeta.refinement==='kept-first'?'전체 문서 생성에 실패했고 아티클 복구도 완료되지 않았습니다. 근거 메모만 제공합니다.':'내용이 짧거나 영상 후반부까지 충분히 다루지 못했습니다. 내용이 많아 보여도 실제 원본 영상 대조가 필요합니다.'}</p>{typeof record.analysisMeta.sourceEndPercent==='number'&&<p>마지막 근거 구간 종료 시점: 영상의 약 {record.analysisMeta.sourceEndPercent}% · 내용 확인률이 아닙니다.</p>}{record.analysisMeta.composeFailureCode&&<p>상세 문서 생성 단계 오류: {record.analysisMeta.composeFailureCode}</p>}<p>사용할 권한이 있는 SRT/VTT 또는 시간 지정 발언 원문을 직접 제공하면 누락을 줄일 수 있습니다. URL만 분석한 결과는 전체 발언을 충분히 반영하지 못할 수 있습니다.</p></div>}<div className="mt-4"><Tabs value={tab} onChange={v=>{setTab(v as Tab);setEditing(false)}} items={labeledTabs}/></div></div>
         <div className="min-h-[350px] p-4 sm:p-6">{warning&&<div role="alert" className="mb-4 rounded-xl border border-amber-700/50 bg-amber-950/20 p-3 text-sm text-amber-200">{warning}</div>}
         {record&&density&&density.shortFields.length>0&&<div className="mb-5 rounded-xl border border-slate-700 bg-slate-900/70 p-4 text-xs leading-6 text-slate-300"><p className="font-semibold text-slate-100">영상 정보에 비해 분석이 간략할 수 있습니다</p><p className="mt-1">{density.shortFields.join(' · ')} 항목이 적거나 설명이 짧습니다. 실제 영상의 확인 가능한 발화가 적거나 AI 출력이 간결했을 수 있습니다. 짧은 영상은 각 구간의 발언을 별도 요청으로 확인하지만, 원본에서 확인되지 않은 내용은 생성하지 않습니다.</p></div>}
-        {!record?<div className="flex min-h-[310px] flex-col items-center justify-center text-center"><div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10 text-3xl text-indigo-300">{phase==='processing'?<span aria-hidden="true" className="h-9 w-9 animate-spin rounded-full border-[3px] border-indigo-300/20 border-t-indigo-300"/>:'✦'}</div><h3 className="text-lg font-semibold">{phase==='processing'?'AI가 영상을 분석하고 있습니다':'아직 분석 결과가 없습니다'}</h3><p className="mt-3 max-w-sm text-sm leading-7 text-slate-400">{phase==='processing'?'진행 상태와 경과 시간을 왼쪽 패널에서 확인할 수 있습니다. 분석 중에는 이 화면을 유지해주세요.':'영상 정보를 확인하고 AI 분석을 시작하면 요약·타임라인·아티클·스크립트가 여기에 표시됩니다. 설정 전에는 가상 결과를 생성하지 않습니다.'}</p></div>:
+        {!record?<div className="flex min-h-[310px] flex-col items-center justify-center text-center"><div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10 text-3xl text-indigo-300">{phase==='processing'?<span aria-hidden="true" className="h-9 w-9 animate-spin rounded-full border-[3px] border-indigo-300/20 border-t-indigo-300"/>:'✦'}</div><h3 className="text-lg font-semibold">{phase==='processing'?'AI가 영상을 분석하고 있습니다':'아직 분석 결과가 없습니다'}</h3><p className="mt-3 max-w-sm text-sm leading-7 text-slate-400">{phase==='processing'?'진행 상태와 경과 시간을 왼쪽 패널에서 확인할 수 있습니다. 분석 중에는 이 화면을 유지해주세요.':'메인에서 분석 시작을 누르면 추가 설정 없이 자동 분석합니다. 원본 영상에서 확인되지 않은 발언은 임의로 채우지 않습니다.'}</p></div>:
         <><div className="mb-5 flex flex-wrap items-center justify-between gap-2"><p className="text-xs text-slate-500">{selected.length}개 항목 {tab==='transcript'?'· 원문 확보 시에만 제공':''}</p><div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={()=>{setEditing(x=>!x);toast.info(editing?'편집을 종료했습니다.':'편집 모드가 활성화됐습니다.',{description:'변경 내용은 현재 화면에만 유지됩니다.'});}}>{editing?'편집 종료':'편집'}</Button><Button variant="ghost" onClick={reset} disabled={!changed}>원본 복원</Button><Button variant="ghost" onClick={copy}>복사</Button></div></div>
         {record&&tab==='timeline'&&timeReview&&<div role="status" className="mb-5 rounded-xl border border-indigo-500/25 bg-indigo-950/20 p-4 text-xs leading-6 text-slate-300">
           <p className="font-semibold text-indigo-200">{timedFromCaptions?'시간 지정 자막 문장·시각 그대로 보존':'AI 생성 발언 초안 · 추정 시각'}</p>
