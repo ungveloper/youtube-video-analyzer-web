@@ -15,15 +15,18 @@ export function mergeSpeechSentences(lines:TranscriptLine[],duration:number):Tra
    const prev=result.at(-1);
    if(!prev){result.push(line);continue;}
    const a=normal(prev.text),b=normal(line.text);
-   if(a===b || (b.length>=10&&a.includes(b)))continue;
-   if(a.length>=10&&b.startsWith(a)){
+   // Keep true repetitions far apart. An incomplete early model guess must
+   // not replace the timestamp of a later, more complete independent quote.
+   const proximity=Math.abs(line.startSeconds-prev.startSeconds);
+   if(proximity<=10&&(a===b || (b.length>=10&&a.includes(b))))continue;
+   if(proximity<=6&&a.length>=10&&b.startsWith(a)){
      prev.text=line.text;prev.endSeconds=Math.max(prev.endSeconds,line.endSeconds);continue;
    }
-   if(b.length>=10&&a.startsWith(b))continue;
    // A gap >=5s is not safe to merge. Never merge a completed sentence.
    const gap=line.startSeconds-prev.endSeconds;
    const delta=line.startSeconds-prev.startSeconds;
-   const continuation= !complete(prev.text) && (hanging(prev.text)||startConnector(line.text)||prev.text.length<28);
+   const freshTopic=/^(?:하지만|반면에|그런데|또한|다음으로|그다음에|그 다음에|그리고 다리|이렇듯|이렇든)(?:\s|,|$)/u.test(line.text);
+   const continuation= !freshTopic && !complete(prev.text) && (hanging(prev.text)||startConnector(line.text)||prev.text.length<28);
    // Independent clips and relistens are separate evidence sources.
    // Merely neighboring (possibly wrong) timestamps are not proof of one
    // sentence; combine across sources only with a literal word overlap.

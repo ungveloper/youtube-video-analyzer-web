@@ -26,24 +26,52 @@ function sharedSpan(a:string,b:string):{at:number;length:number}{
   return best;
 }
 
+/** Ordered shared characters, unlike longest contiguous string matching.
+ * Restrict fuzzy grouping to HIGH substring coverage and nearby starts:
+ * two distinct disease explanations can share words without being repeats.
+ */
+function sequenceCoverage(shorter:string,longer:string):number{
+  if(!shorter||!longer)return 0;
+  if(shorter.length>240||longer.length>500)return 0;
+  let prev=new Uint16Array(longer.length+1);
+  for(const ch of shorter){
+    const next=new Uint16Array(longer.length+1);
+    for(let j=1;j<=longer.length;j++)
+      next[j]=ch===longer[j-1]?prev[j-1]+1:Math.max(next[j-1],prev[j]);
+    prev=next;
+  }
+  return prev[longer.length]/shorter.length;
+}
+
 function duplicates(a:TranscriptLine,b:TranscriptLine):boolean{
-  const x=normalize(a.text),y=normalize(b.text),short=Math.min(x.length,y.length),long=Math.max(x.length,y.length);
+  const x=normalize(a.text),y=normalize(b.text);
+  const short=Math.min(x.length,y.length),long=Math.max(x.length,y.length);
   const distance=Math.abs(a.startSeconds-b.startSeconds);
   if(!short||distance>27)return false;
-  // Two truly repeated spoken statements can occur in the same video. A
-  // distant time estimate is deduplicated only against an independent audio
-  // re-listen and with near-exact text, not loose topical resemblance.
-  if(distance>12){
-    if(![a,b].some(l=>l.id.startsWith('coverage-')))return false;
-    return x===y || ((x.includes(y)||y.includes(x)) && short>=17 && (short/long>=.82 || (short>=22 && /(?:의|에|는|은|을|를|는데|가지고|다가|으니|니까|어서|면서)$/u.test([a,b].find(v=>normalize(v.text).length===short)?.text.trim()||''))));
-  }
+  // Genuine spoken repetition must survive if separated in the video.
+  // For large estimated clock differences only identical independent re-listens
+  // can be trusted enough to deduplicate.
+  if(distance>14)return [a,b].some(l=>l.id.startsWith('coverage-')) && (x===y || ((x.includes(y)||y.includes(x)) && short>=20));
   if(x===y)return true;
-  if(short<8)return false;
-  if(x.includes(y)||y.includes(x))return short>=11 || distance<=5;
-  const shared=sharedSpan(x,y).length;
-  // Close-in wording variants are often the same Gemini speech repeated by
-  // a neighbor clip. Do not equate two distinct content-rich sentences.
-  return short>=14 && shared>=11 && shared/short>=.60 && distance<=6;
+  const containment=x.includes(y)||y.includes(x);
+  if(containment)return short>=8 || distance<=5;
+  if(short<9)return false;
+  // Adjacent clips often disagree on 1-2 Korean syllables (이렇듯/이렇든,
+  // 손쉽게/쉽게), but the remaining ordered quotation is identical.
+  // Only dedupe a high-coverage fragment within one local speech interval.
+  const orderedShort=x.length<=y.length?x:y,orderedLong=x.length>y.length?x:y;
+  if(distance<=12 && short>=11){
+    const shared=sharedSpan(x,y).length;
+    // A shared ending is not proof that two DIFFERENT subjects describe the
+    // same utterance (e.g. disease A vs disease B). Require an ordered lead-in
+    // anchor, except an almost exact one-syllable recognition variation.
+    const leadingAnchor=orderedLong.includes(orderedShort.slice(0,2));
+    if(!leadingAnchor && shared/short<.91)return false;
+    if(short/long>=.75 && /(?:아니|않|없|못)/u.test(x)!==/(?:아니|않|없|못)/u.test(y))return false;
+    if(shared>=10 && shared/short>=(short<=12?.90:.70))return true;
+    if(leadingAnchor && sequenceCoverage(orderedShort,orderedLong)>=.90 && (shared>=8 || short>=25))return true;
+  }
+  return false;
 }
 
 /** Join ONLY a literal trailing phrase repeated at the start of the next
@@ -91,9 +119,10 @@ function suspiciousCollage(line:TranscriptLine,all:TranscriptLine[]):boolean{
 const score=(l:TranscriptLine)=>{
   const text=l.text.trim();
   const length=Math.min(200,normalize(text).length);
-  const reviewed=l.id.startsWith('coverage-')?12:0;
+  // Do not let a short relisten fragment displace a fuller original quote.
+  const reviewed=l.id.startsWith('coverage-')?2:0;
   const complete=/[.!?。！？]\s*$/.test(text)?3:0;
-  const hanging=/(?:의|는|은|가|를|을|인데|그래서|그리고|여러분의|가지고|다가|으니)\s*$/.test(text)?-8:0;
+  const hanging=/(?:의|는|은|가|를|을|인데|그래서|그리고|여러분의|가지고|다가|으니|,|、)\s*$/.test(text)?-12:0;
   return length*.55+reviewed+complete+hanging;
 };
 
