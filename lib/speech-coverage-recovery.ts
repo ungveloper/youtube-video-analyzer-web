@@ -150,16 +150,30 @@ export function planSpeechRepairWindows(lines:TranscriptLine[],duration:number):
     const isHead=i===0,isTail=i===ordered.length;
     const threshold=isHead?9:isTail?8:9;
     if(gap>=threshold){
-      let from=Math.max(0,Math.floor(cursor-4));
-      let to=Math.min(duration,Math.ceil(next+4));
-      if(isTail)from=Math.max(0,Math.min(from,duration-35));
-      if(to-from>52){
-        // Center on the missing speech; don't convert a 60s hole into
-        // an unsafe and expensive unlimited video request.
-        const mid=(cursor+next)/2;
-        from=Math.max(0,Math.floor(mid-26));to=Math.min(duration,from+52);
+      // A single 52s crop used to hide BOTH ends of a 60-90s transcript hole.
+      // Cover the entire missing interior with two/three bounded, overlapping
+      // real-video clips. This is evidence discovery, not generated text.
+      if(!isHead&&!isTail&&gap>=54){
+        const count=Math.min(3,Math.max(2,Math.ceil((gap+8)/48)));
+        for(let piece=0;piece<count;piece++){
+          const left=cursor+(gap*piece/count);
+          const right=cursor+(gap*(piece+1)/count);
+          const from=Math.max(0,Math.floor(left-4));
+          const to=Math.min(duration,Math.min(from+52,Math.ceil(right+4)));
+          // Priority over a short transition-cue review: a missing minute
+          // must consume the first two recovery slots, not just one.
+          candidates.push({from,to,score:gap+42-piece, label:`long-gap-${piece}`});
+        }
+      }else{
+        let from=Math.max(0,Math.floor(cursor-4));
+        let to=Math.min(duration,Math.ceil(next+4));
+        if(isTail)from=Math.max(0,Math.min(from,duration-35));
+        if(to-from>52){
+          const mid=(cursor+next)/2;
+          from=Math.max(0,Math.floor(mid-26));to=Math.min(duration,from+52);
+        }
+        candidates.push({from,to,score:gap+(isHead?28:isTail?15:cursor>=60?10:3),label:isHead?'start':isTail?'end':'interior'});
       }
-      candidates.push({from,to,score:gap+(isHead?28:isTail?15:cursor>=60?10:3),label:isHead?'start':isTail?'end':'interior'});
     }
     if(i<ordered.length)cursor=Math.max(cursor,ordered[i].endSeconds);
   }

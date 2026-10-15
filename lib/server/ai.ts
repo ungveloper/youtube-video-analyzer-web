@@ -18,7 +18,7 @@ import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
-import {mergeSpeechSentences} from '@/lib/speech-sentence-merge';
+import {mergeSpeechSentences,largestSpeechGap} from '@/lib/speech-sentence-merge';
 import {finalizeSpeechTimeline} from '@/lib/speech-finalize';
 import {salvageRejectedSpeech,planSpeechRepairWindows,makeSpeechCoverageRequest,extractCoverageReviewRows,mergeIndependentCoverage} from '@/lib/speech-coverage-recovery';
 import {chooseSpeechGapAudit,mergeGapAuditedLines,planSpeechClockAudit,makeSpeechClockAuditRequest,applySpeechClockAudit} from '@/lib/speech-audit';
@@ -415,27 +415,50 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   // Unlike text-only composition, these requests can discover absent utterances.
   const repairWindows=planSpeechRepairWindows(finalLines,video.durationSeconds);
   console.info(JSON.stringify({event:'analysis.speech_repair_plan',requestId,windows:repairWindows,firstStart:finalLines[0]?.startSeconds??null,lastEnd:finalLines.at(-1)?.endSeconds??null}));
-  for(const [reviewIndex,coverageWindow] of repairWindows.entries()){
-    if(outcomes.some(x=>x.failure==='FREE_LIMIT')||auditQuotaExceeded)break;
+  // A missing minute is larger than one 52s video clip. Parallelize only
+  // its first two split windows so the same 205s speech deadline has a real
+  // chance to hear BOTH halves. Reconcile results serially in timestamp order.
+  const severeInterval=largestSpeechGap(finalLines,video.durationSeconds,54);
+  const splitSevere=Boolean(severeInterval && severeInterval.from>0 && severeInterval.to<video.durationSeconds &&
+    repairWindows.length>=2 && repairWindows[0].from<=severeInterval.from && repairWindows[1].to>=severeInterval.to);
+  type CoverageAttempt={reviewIndex:number;window:typeof repairWindows[number];reviewed?:ReturnType<typeof extractCoverageReviewRows>};
+  async function listenCoverage(reviewIndex:number,coverageWindow:typeof repairWindows[number]):Promise<CoverageAttempt>{
     const remaining=speechDeadline-Date.now();
-    if(remaining<15000){console.warn(JSON.stringify({event:'analysis.speech_coverage_review_skipped',requestId,reason:'time_budget',reviewIndex}));break;}
+    if(remaining<15000){
+      console.warn(JSON.stringify({event:'analysis.speech_coverage_review_skipped',requestId,reason:'time_budget',reviewIndex,remaining}));
+      return {reviewIndex,window:coverageWindow};
+    }
     coverageReviews++;
     providerCalls++;
     onProgress({type:'progress',step:2,label:`누락 발언 재확인 ${reviewIndex+1}/${repairWindows.length}`,detail:`영상 ${coverageWindow.from}~${coverageWindow.to}초를 독립적으로 다시 듣고 누락된 실제 발언을 확인합니다. 무료 요청 ${providerCalls}회차입니다.`});
     try{
       const secondListen=await interaction({key,model:activeModel,requestId,pass:`speech-coverage-${reviewIndex}`,input:makeSpeechCoverageRequest(video.url,coverageWindow),format:clipSpeechFormat,signal,timeoutMs:Math.min(41000,remaining-1000),thinkingLevel:'low',maxOutputTokens:4600});
-      const reviewed=extractCoverageReviewRows(secondListen.parsed,coverageWindow,video.durationSeconds);
-      const reconciled=mergeIndependentCoverage(finalLines,reviewed.lines,coverageWindow,video.durationSeconds);
-      finalLines=mergeSpeechSentences(reconciled.lines,video.durationSeconds);
-      coverageAdded+=reconciled.added;
-      clockCorrections+=reconciled.corrections;
-      console.info(JSON.stringify({event:'analysis.speech_coverage_review',requestId,reviewIndex,window:coverageWindow,heard:reviewed.lines.length,invalid:reviewed.invalid,added:reconciled.added,duplicates:reconciled.duplicates,timeCorrections:reconciled.corrections,reason:reconciled.reason,total:finalLines.length}));
+      return {reviewIndex,window:coverageWindow,reviewed:extractCoverageReviewRows(secondListen.parsed,coverageWindow,video.durationSeconds)};
     }catch(error){
       if(signal?.aborted)throw new ServiceError('CANCELLED','분석이 중단되었습니다.',499);
       const code=error instanceof ServiceError?error.code:'PROVIDER_UNAVAILABLE';
       if(code==='FREE_LIMIT')auditQuotaExceeded=true;
       console.warn(JSON.stringify({event:'analysis.speech_coverage_review_failed',requestId,reviewIndex,code}));
+      return {reviewIndex,window:coverageWindow};
     }
+  }
+  for(let reviewIndex=0;reviewIndex<repairWindows.length;){
+    if(outcomes.some(x=>x.failure==='FREE_LIMIT')||auditQuotaExceeded)break;
+    const batchSize=splitSevere&&reviewIndex===0?2:1;
+    const attempted=await Promise.all(repairWindows.slice(reviewIndex,reviewIndex+batchSize)
+      .map((coverageWindow,index)=>listenCoverage(reviewIndex+index,coverageWindow)));
+    // No concurrent mutation of finalLines: both independent video listens
+    // finish, then each validated result is merged into the latest transcript.
+    for(const attempt of attempted){
+      if(!attempt.reviewed)continue;
+      const reviewed=attempt.reviewed,coverageWindow=attempt.window;
+      const reconciled=mergeIndependentCoverage(finalLines,reviewed.lines,coverageWindow,video.durationSeconds);
+      finalLines=mergeSpeechSentences(reconciled.lines,video.durationSeconds);
+      coverageAdded+=reconciled.added;
+      clockCorrections+=reconciled.corrections;
+      console.info(JSON.stringify({event:'analysis.speech_coverage_review',requestId,reviewIndex:attempt.reviewIndex,window:coverageWindow,heard:reviewed.lines.length,invalid:reviewed.invalid,added:reconciled.added,duplicates:reconciled.duplicates,timeCorrections:reconciled.corrections,reason:reconciled.reason,total:finalLines.length}));
+    }
+    reviewIndex+=batchSize;
   }
   // Avoid redundant third/fourth listens if central coverage cross-check ran.
   const uncovered=coverageReviews===0 && finalLines.length>=8 ? chooseSpeechGapAudit(finalLines,video.durationSeconds,8) : null;
@@ -480,6 +503,9 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   const finalized=finalizeSpeechTimeline(finalLines,video.durationSeconds);
   finalLines=finalized.lines;
   console.info(JSON.stringify({event:'analysis.speech_final_reconcile',requestId,before:finalLines.length+finalized.duplicatesRemoved+finalized.collagesQuarantined,after:finalLines.length,duplicatesRemoved:finalized.duplicatesRemoved,collagesQuarantined:finalized.collagesQuarantined,unverifiedTimeCollisions:finalized.unverifiedTimeCollisions}));
+  const unresolvedSevereGap=largestSpeechGap(finalLines,video.durationSeconds,35);
+  const severeGapWarning=unresolvedSevereGap && unresolvedSevereGap.from>0 && unresolvedSevereGap.to<video.durationSeconds ? unresolvedSevereGap : null;
+  if(severeGapWarning)console.warn(JSON.stringify({event:'analysis.speech_severe_gap_unresolved',requestId,window:severeGapWarning,providerCalls,coverageReviews,quotaStopped:auditQuotaExceeded||outcomes.some(x=>x.failure==='FREE_LIMIT')}));
   const source=speechSource(finalLines,video.durationSeconds);
   console.info(JSON.stringify({event:'analysis.speech_clip_coverage',requestId,model:activeModel,coveredSegments:merged.coveredSegments,failedSegments:merged.failedSegments,missingWindows:merged.missingWindows,lines:merged.lines.length,rejected:merged.rejected,lastEnd:finalLines.at(-1)?.endSeconds??null,providerCalls}));
   if(!source.claims.length){
@@ -508,6 +534,7 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   const missing=formatMissingWindows(speechReviewWindows(finalLines,video.durationSeconds));
   content.exclusions=content.exclusions.filter(x=>!/(마지막 원문 근거 종료|발화 없음|영상의 일부 발언 구간)/.test(x));
   if(missing)content.exclusions.push(`발언을 확인하지 못한 시간 구간: ${missing}. 확인되지 않은 발언과 시각은 생성하지 않았습니다.`);
+  if(severeGapWarning)content.exclusions.push(`⚠️ 심각한 발언 누락: ${formatMissingWindows([severeGapWarning])} 구간의 음성을 충분히 확보하지 못했습니다. 타임라인이 불완전하며, 해당 구간을 확인할 수 있는 시간 지정 자막 또는 재분석이 필요합니다.`);
   if(finalized.collagesQuarantined)content.exclusions.push(`서로 다른 시간대의 발언이 섞인 것으로 의심되는 문장 ${finalized.collagesQuarantined}개는 타임라인에서 제외했습니다. 원본 영상 대조가 필요합니다.`);
   if(finalized.unverifiedTimeCollisions)content.exclusions.push(`내용이 다른 문장 사이의 추정 시각 겹침 ${finalized.unverifiedTimeCollisions}건은 실제 음성 시각을 검증하지 못해 그대로 보존했습니다.`);
   if(preserved.recovered>0 || coverageAdded>0)content.exclusions.push('영상 발언 누락 방지를 위해 겹치는 추정 시각의 서로 다른 문장과 독립 재분석에서 확인된 발언을 보존했습니다. 시각은 원본과 대조해야 합니다.');
