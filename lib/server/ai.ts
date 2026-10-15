@@ -401,6 +401,13 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
     outcomes.push(...rest);
     if(rest.some(outcome=>outcome.failure==='FREE_LIMIT'))break;
   }
+  // HTTP 429 means the provider did NOT transcribe the requested primary clips.
+  // Never turn a successful late-clip probe into a fake completed full video.
+  const quotaClips=outcomes.filter(o=>o.failure==='FREE_LIMIT');
+  if(quotaClips.length){
+    console.warn(JSON.stringify({event:'analysis.speech_quota_abort',requestId,phase:'primary_clips',failedIndices:quotaClips.map(x=>x.segment.index),successfulIndices:outcomes.filter(x=>x.parsed&&!x.failure).map(x=>x.segment.index),providerCalls,resultDiscarded:true}));
+    throw new ServiceError('FREE_LIMIT','Google Gemini가 영상 구간 분석 도중 HTTP 429(무료 사용량 또는 요청 속도 제한)를 반환했습니다. 영상 전체를 확보하지 못해 일부 발언만으로 분석 결과를 생성하지 않았습니다. 제한이 해제된 후 다시 시도하거나 시간 지정 자막을 입력해 주세요.',429);
+  }
   const merged=collectSpeechClipResults(outcomes,segments);
   // Keep distinct audible phrases the strict time-overlap filter rejected.
   // All candidates still need a valid original clip and core ownership.
@@ -498,11 +505,24 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
       console.warn(JSON.stringify({event:'analysis.speech_clock_audit_failed',requestId,code:error instanceof ServiceError?error.code:'PROVIDER_UNAVAILABLE'}));
     }
   }
+  // Optional video relistens can also exhaust the free tier. In that case,
+  // never quietly skip article generation and call the output 'completed'.
+  if(auditQuotaExceeded){
+    console.warn(JSON.stringify({event:'analysis.speech_quota_abort',requestId,phase:'audio_review',providerCalls,resultDiscarded:true}));
+    throw new ServiceError('FREE_LIMIT','무료 Gemini 사용량 또는 요청 속도 제한(HTTP 429)으로 발언 검토가 중단됐습니다. 불완전한 결과를 성공으로 저장하지 않았습니다. 제한이 해제된 후 다시 시도하거나 시간 지정 자막을 입력해 주세요.',429);
+  }
   // All independent audio reviews are finished. Reject cross-time collages
   // and duplicated quote fragments WITHOUT merging unrelated spoken words.
   const finalized=finalizeSpeechTimeline(finalLines,video.durationSeconds);
   finalLines=finalized.lines;
   console.info(JSON.stringify({event:'analysis.speech_final_reconcile',requestId,before:finalLines.length+finalized.duplicatesRemoved+finalized.collagesQuarantined,after:finalLines.length,duplicatesRemoved:finalized.duplicatesRemoved,collagesQuarantined:finalized.collagesQuarantined,unverifiedTimeCollisions:finalized.unverifiedTimeCollisions}));
+  // A failed primary clip plus an unresolved >=45s interval is not a
+  // usable full-video transcript, even when other clips succeeded.
+  const failedCoreGap=merged.failedSegments.length ? largestSpeechGap(finalLines,video.durationSeconds,45) : null;
+  if(failedCoreGap){
+    console.warn(JSON.stringify({event:'analysis.speech_incomplete_abort',requestId,failedSegments:merged.failedSegments,unverifiedWindow:failedCoreGap,providerCalls,resultDiscarded:true}));
+    throw new ServiceError('SPEECH_INCOMPLETE',`영상의 주요 구간 분석 실패로 ${formatMissingWindows([failedCoreGap])} 발언을 확인하지 못했습니다. 일부 결과만으로 완료 처리하지 않았습니다. 잠시 후 재시도하거나 시간 지정 자막을 입력해 주세요.`,503);
+  }
   const unresolvedSevereGap=largestSpeechGap(finalLines,video.durationSeconds,35);
   const severeGapWarning=unresolvedSevereGap && unresolvedSevereGap.from>0 && unresolvedSevereGap.to<video.durationSeconds ? unresolvedSevereGap : null;
   if(severeGapWarning)console.warn(JSON.stringify({event:'analysis.speech_severe_gap_unresolved',requestId,window:severeGapWarning,providerCalls,coverageReviews,quotaStopped:auditQuotaExceeded||outcomes.some(x=>x.failure==='FREE_LIMIT')}));
@@ -523,6 +543,10 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
       content={...parsed};composeOk=true;
     }catch(error){
       if(signal?.aborted)throw error;
+      if(error instanceof ServiceError && error.code==='FREE_LIMIT'){
+        console.warn(JSON.stringify({event:'analysis.speech_quota_abort',requestId,phase:'compose',providerCalls,resultDiscarded:true}));
+        throw new ServiceError('FREE_LIMIT','무료 Gemini 사용량 또는 요청 속도 제한(HTTP 429)으로 아티클 생성이 중단됐습니다. 완성된 분석으로 표시하지 않았습니다. 제한이 해제된 후 다시 시도해 주세요.',429);
+      }
       console.warn(JSON.stringify({event:'analysis.speech_compose_failed',requestId,code:error instanceof ServiceError?error.code:'UNKNOWN'}));
     }
   }

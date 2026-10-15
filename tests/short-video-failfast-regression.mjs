@@ -64,7 +64,7 @@ function setup(response){
   // This provider fail-fast suite models only one utterance per ~34s core.
   // Such deliberately sparse artificial data must not spend an extra mocked
   // provider request on gap recovery; the real gap policy has its own tests.
-  largestSpeechGap:()=>null,
+  largestSpeechGap:sentenceFns.largestSpeechGap,
   chooseSpeechGapAudit:()=>null,
   planSpeechClockAudit:()=>null,
   mergeGapAuditedLines:()=>{throw Error('Unexpected gap review in outage harness');},
@@ -106,22 +106,17 @@ assert.deepEqual(recovered.calls.slice(2,7).map(c=>c.pass).sort(),['speech-clip-
 assert.equal(recovered.calls[7].pass,'speech-compose');
 assert(record.original.exclusions.some(s=>s.includes('허용된 다른 무료 모델')));
 
-// Successful first probe with failed middle clips must preserve partial speech.
+// A late successful probe plus five failed clips must NOT be a completed analysis.
 const partial=setup(args=>args.pass==='speech-clip-5'||args.pass==='speech-compose'?null:'PROVIDER_BUSY');
-const partialRecord=await partial.run();
-assert.equal(partialRecord.model,'gemini-3.8-flash');
-assert.equal(partialRecord.original.transcript.length,1);
-assert.equal(partialRecord.analysisMeta.qualityStatus,'partial');
-assert.equal(partial.calls.length,7);
-assert(partialRecord.original.exclusions.some(s=>s.includes('발언을 확인하지 못한 시간 구간')));
+await assert.rejects(partial.run(),e=>e.code==='SPEECH_INCOMPLETE'&&e.status===503);
+assert.equal(partial.calls.length,6,'No article composition after catastrophic missing audio');
+assert(!partial.calls.some(c=>c.pass==='speech-compose'));
 
-// Quota during the first remaining batch must stop further video requests
-// and preserve the successful probe (never compose after a quota rejection).
+// A real HTTP 429 after a successful last clip is a FAILED analysis,
+// never a misleading successful 7-line full-video transcript.
 const quotaMid=setup(args=>args.pass==='speech-clip-0'?'FREE_LIMIT':null);
-const quotaRecord=await quotaMid.run();
+await assert.rejects(quotaMid.run(),e=>e.code==='FREE_LIMIT'&&e.status===429&&e.message.includes('일부 발언만으로'));
 assert.equal(quotaMid.calls.length,3);
 assert(!quotaMid.calls.some(c=>c.pass==='speech-compose'));
-assert.equal(quotaRecord.analysisMeta.qualityStatus,'partial');
-assert(quotaRecord.original.transcript.length>=1);
 
-console.log('PASS: six overlapped precision clips; 503 x2 fail-fast; fallback same free tier; batch=2; 429; partial transcript');
+console.log('PASS: six clips; 503 x2 fail-fast; free fallback; 429 after successful probe fails safely; catastrophic missing speech blocks completed result');
