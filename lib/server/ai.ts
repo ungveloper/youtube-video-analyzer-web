@@ -20,7 +20,7 @@ import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
 import {mergeSpeechSentences} from '@/lib/speech-sentence-merge';
 import {finalizeSpeechTimeline} from '@/lib/speech-finalize';
-import {salvageRejectedSpeech,planSpeechCoverageWindows,makeSpeechCoverageRequest,extractCoverageReviewRows,mergeIndependentCoverage} from '@/lib/speech-coverage-recovery';
+import {salvageRejectedSpeech,planSpeechRepairWindows,makeSpeechCoverageRequest,extractCoverageReviewRows,mergeIndependentCoverage} from '@/lib/speech-coverage-recovery';
 import {chooseSpeechGapAudit,mergeGapAuditedLines,planSpeechClockAudit,makeSpeechClockAuditRequest,applySpeechClockAudit} from '@/lib/speech-audit';
 import {speechClipFailureCode,shouldTryFreeModelFallback,SPEECH_PROBE_TIMEOUT_MS,SPEECH_CLIP_TIMEOUT_MS,SPEECH_FALLBACK_WAIT_MS} from '@/lib/speech-clip-recovery';
 // Single-call, source-grounded editorial instructions. Detail varies with video length;
@@ -411,15 +411,17 @@ async function speechFocusedAnalysis(video:VideoInfo,model:FreeModelId,key:strin
   let coverageReviews=0;
   let coverageAdded=0;
   let clockCorrections=0;
-  // Two independent short video listens cross-check the middle of the video.
+  // Up to three bounded evidence-based audio relistens cover actual gaps, including head and tail.
   // Unlike text-only composition, these requests can discover absent utterances.
-  for(const [reviewIndex,coverageWindow] of planSpeechCoverageWindows(video.durationSeconds).entries()){
+  const repairWindows=planSpeechRepairWindows(finalLines,video.durationSeconds);
+  console.info(JSON.stringify({event:'analysis.speech_repair_plan',requestId,windows:repairWindows,firstStart:finalLines[0]?.startSeconds??null,lastEnd:finalLines.at(-1)?.endSeconds??null}));
+  for(const [reviewIndex,coverageWindow] of repairWindows.entries()){
     if(outcomes.some(x=>x.failure==='FREE_LIMIT')||auditQuotaExceeded)break;
     const remaining=speechDeadline-Date.now();
     if(remaining<15000){console.warn(JSON.stringify({event:'analysis.speech_coverage_review_skipped',requestId,reason:'time_budget',reviewIndex}));break;}
     coverageReviews++;
     providerCalls++;
-    onProgress({type:'progress',step:2,label:`중반 발언 누락 재확인 ${reviewIndex+1}/2`,detail:`영상 ${coverageWindow.from}~${coverageWindow.to}초를 독립적으로 다시 듣고 누락된 실제 발언을 확인합니다. 무료 요청 ${providerCalls}회차입니다.`});
+    onProgress({type:'progress',step:2,label:`누락 발언 재확인 ${reviewIndex+1}/${repairWindows.length}`,detail:`영상 ${coverageWindow.from}~${coverageWindow.to}초를 독립적으로 다시 듣고 누락된 실제 발언을 확인합니다. 무료 요청 ${providerCalls}회차입니다.`});
     try{
       const secondListen=await interaction({key,model:activeModel,requestId,pass:`speech-coverage-${reviewIndex}`,input:makeSpeechCoverageRequest(video.url,coverageWindow),format:clipSpeechFormat,signal,timeoutMs:Math.min(41000,remaining-1000),thinkingLevel:'low',maxOutputTokens:4600});
       const reviewed=extractCoverageReviewRows(secondListen.parsed,coverageWindow,video.durationSeconds);

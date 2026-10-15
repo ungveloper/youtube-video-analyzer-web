@@ -28,17 +28,41 @@ function sharedSpan(a:string,b:string):{at:number;length:number}{
 
 function duplicates(a:TranscriptLine,b:TranscriptLine):boolean{
   const x=normalize(a.text),y=normalize(b.text),short=Math.min(x.length,y.length),long=Math.max(x.length,y.length);
-  if(!short||Math.abs(a.startSeconds-b.startSeconds)>27)return false;
+  const distance=Math.abs(a.startSeconds-b.startSeconds);
+  if(!short||distance>27)return false;
+  // Two truly repeated spoken statements can occur in the same video. A
+  // distant time estimate is deduplicated only against an independent audio
+  // re-listen and with near-exact text, not loose topical resemblance.
+  if(distance>12){
+    if(![a,b].some(l=>l.id.startsWith('coverage-')))return false;
+    return x===y || ((x.includes(y)||y.includes(x)) && short>=17 && (short/long>=.82 || (short>=22 && /(?:의|에|는|은|을|를|는데|가지고|다가|으니|니까|어서|면서)$/u.test([a,b].find(v=>normalize(v.text).length===short)?.text.trim()||''))));
+  }
   if(x===y)return true;
   if(short<8)return false;
-  const same=(x.includes(y)||y.includes(x));
-  // A short repeated clause can be part of a longer, complete sentence.
-  if(same)return short>=11 || Math.abs(a.startSeconds-b.startSeconds)<=8;
+  if(x.includes(y)||y.includes(x))return short>=11 || distance<=5;
   const shared=sharedSpan(x,y).length;
-  // A later fragment may repeat the ending of a fuller sentence with a
-  // small spelling difference (e.g. extra modifier) in the first few words.
-  if(short>=14 && shared>=11 && shared/short>=.60 && Math.abs(a.startSeconds-b.startSeconds)<=7)return true;
-  return short>=16 && short/long>=.47 && shared/short>=.78 && shared>=13;
+  // Close-in wording variants are often the same Gemini speech repeated by
+  // a neighbor clip. Do not equate two distinct content-rich sentences.
+  return short>=14 && shared>=11 && shared/short>=.60 && distance<=6;
+}
+
+/** Join ONLY a literal trailing phrase repeated at the start of the next
+ * utterance. Unlike generic sentence merging, no unseen word is introduced.
+ * Source text must be auditable: A + the non-overlapping suffix of B.
+ */
+function joinQuotedOverlap(first:TranscriptLine,second:TranscriptLine):TranscriptLine|null{
+  if(second.startSeconds<first.startSeconds||second.startSeconds-first.startSeconds>14||second.startSeconds>first.endSeconds+6)return null;
+  if(/[.!?。！？]\s*$/.test(first.text))return null;
+  const a=first.text.trim(),b=second.text.trim();
+  for(let n=Math.min(a.length,b.length,100);n>=12;n--){
+    if(a.slice(-n)!==b.slice(0,n))continue;
+    const rest=b.slice(n).trimStart();
+    if(rest.length<5)continue;
+    const combined=(a+' '+rest).replace(/\s+/g,' ').trim();
+    if(combined.length>900)continue;
+    return {...first,text:combined,endSeconds:Math.max(first.endSeconds,second.endSeconds)};
+  }
+  return null;
 }
 
 /** A collage contains distinct long quotations ALSO present in other rows,
@@ -82,26 +106,27 @@ export function finalizeSpeechTimeline(input:TranscriptLine[],duration:number):F
   const validRows=input.filter(l=>valid(l,duration)).map(l=>({...l,text:l.text.trim()})).sort((a,b)=>a.startSeconds-b.startSeconds);
   const quarantined=new Set(validRows.filter(l=>suspiciousCollage(l,validRows)));
   const remaining=validRows.filter(l=>!quarantined.has(l));
-  const parent=remaining.map((_,i)=>i);
-  const find=(i:number):number=>{while(parent[i]!==i){parent[i]=parent[parent[i]];i=parent[i];}return i;};
-  for(let i=0;i<remaining.length;i++)for(let j=i+1;j<remaining.length;j++){
-    if(remaining[j].startSeconds-remaining[i].startSeconds>27)break;
-    if(duplicates(remaining[i],remaining[j])){
-      const a=find(i),b=find(j);if(a!==b)parent[b]=a;
-    }
+  // Reconstruct one sentence when independently returned rows share a literal
+  // suffix/prefix (e.g. “결국 ... 폐색되는” repeated before its ending). Do this
+  // BEFORE duplicate filtering so the shorter clause cannot displace the full
+  // speech; never assemble lines solely due to neighboring timestamps.
+  const stitched:TranscriptLine[]=[];
+  for(const row of remaining){
+    const prev=stitched.at(-1);
+    const joined=prev?joinQuotedOverlap(prev,row):null;
+    if(joined){stitched[stitched.length-1]=joined;}
+    else stitched.push(row);
   }
-  const grouped=new Map<number,TranscriptLine[]>();
-  for(let i=0;i<remaining.length;i++){
-    const p=find(i);const g=grouped.get(p)||[];g.push(remaining[i]);grouped.set(p,g);
-  }
+  // v4.2 transitive union-find collapsed A~B and B~C even when A and C
+  // describe DIFFERENT speech. Each rejected row must directly match ONE
+  // retained row. A fuzzy bridge can no longer erase a 30s time span.
+  const ranked=stitched.map((l,i)=>({l,i})).sort((a,b)=>score(b.l)-score(a.l)||a.l.startSeconds-b.l.startSeconds);
   const kept:TranscriptLine[]=[];
-  for(const group of grouped.values()){
-    group.sort((a,b)=>score(b)-score(a)||a.startSeconds-b.startSeconds);
-    kept.push(group[0]);
+  for(const {l} of ranked){
+    if(kept.some(existing=>duplicates(existing,l)))continue;
+    kept.push(l);
   }
   kept.sort((a,b)=>a.startSeconds-b.startSeconds||a.endSeconds-b.endSeconds);
-  // Distinct content at conflicting model times is deliberately NOT deleted.
-  // Expose the uncertainty instead of pretending we verified these timecodes.
   let unverifiedTimeCollisions=0;
   for(let i=1;i<kept.length;i++){
     const prev=kept[i-1],curr=kept[i];

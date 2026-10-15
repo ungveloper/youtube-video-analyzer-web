@@ -24,7 +24,23 @@ export function mergeSpeechSentences(lines:TranscriptLine[],duration:number):Tra
    const gap=line.startSeconds-prev.endSeconds;
    const delta=line.startSeconds-prev.startSeconds;
    const continuation= !complete(prev.text) && (hanging(prev.text)||startConnector(line.text)||prev.text.length<28);
-   if(gap<=4.5&&gap>=-2&&delta<=15&&continuation&&prev.text.length+line.text.length<230){
+   // Independent clips and relistens are separate evidence sources.
+   // Merely neighboring (possibly wrong) timestamps are not proof of one
+   // sentence; combine across sources only with a literal word overlap.
+   const sourceKey=(id:string)=>{
+     const core=/^(?:segment|salvaged)-(\d+)-/.exec(id);
+     if(core)return `core-${core[1]}`;
+     const review=/^coverage-(\d+)-/.exec(id);
+     if(review)return `review-${review[1]}`;
+     return id.startsWith('segment-')||id.startsWith('salvaged-')||id.startsWith('coverage-')?id:'unknown';
+   };
+   const sameSource=sourceKey(prev.id)===sourceKey(line.id);
+   const literalShared=(()=>{
+     for(let k=Math.min(prev.text.length,line.text.length,70);k>=10;k--)
+       if(normal(prev.text.slice(-k))===normal(line.text.slice(0,k)))return true;
+     return false;
+   })();
+   if(gap<=4.5&&gap>=-2&&delta<=15&&continuation&&prev.text.length+line.text.length<230&&(sameSource||literalShared)){
      const suffixOverlap=(()=>{for(let k=Math.min(prev.text.length,line.text.length,45);k>=7;k--)if(normal(prev.text.slice(-k))===normal(line.text.slice(0,k)))return k;return 0;})();
      prev.text=(prev.text+(suffixOverlap?line.text.slice(suffixOverlap):' '+line.text)).replace(/\s+/g,' ').trim();
      prev.endSeconds=Math.max(prev.endSeconds,line.endSeconds);

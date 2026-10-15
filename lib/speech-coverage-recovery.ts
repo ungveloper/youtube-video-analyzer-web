@@ -130,3 +130,48 @@ export function mergeIndependentCoverage(existing:TranscriptLine[],reviewed:Tran
   for(const item of unmatched){if(uniqueAppend(result,item))added++;}
   return {lines:result.sort((a,b)=>a.startSeconds-b.startSeconds),added,duplicates,corrections,reason};
 }
+
+
+/** Adapt recovery to OBSERVED audio gaps, not to one fixed video or two
+ * hardwired middle windows. Starts/ends must be considered: in v4.2 a
+ * successful middle review prevented any retry of a missing 00:00–00:33.
+ * No speech is fabricated; every returned phrase still comes from Gemini.
+ */
+export function planSpeechRepairWindows(lines:TranscriptLine[],duration:number):VideoReviewWindow[]{
+  if(!Number.isFinite(duration)||duration<120||duration>300)return [];
+  const ordered=lines.filter(l=>Number.isFinite(l.startSeconds)&&Number.isFinite(l.endSeconds)&&l.startSeconds>=0&&l.endSeconds>l.startSeconds&&l.endSeconds<=duration).sort((a,b)=>a.startSeconds-b.startSeconds);
+  if(!ordered.length)return [{from:0,to:Math.min(48,duration)},{from:Math.max(0,Math.floor(duration*.54)),to:Math.min(duration,Math.floor(duration*.54)+48)}];
+  type Candidate=VideoReviewWindow&{score:number;label:string};
+  const candidates:Candidate[]=[];
+  let cursor=0;
+  for(let i=0;i<=ordered.length;i++){
+    const next=i<ordered.length?ordered[i].startSeconds:duration;
+    const gap=next-cursor;
+    const isHead=i===0,isTail=i===ordered.length;
+    const threshold=isHead?9:isTail?8:9;
+    if(gap>=threshold){
+      let from=Math.max(0,Math.floor(cursor-4));
+      let to=Math.min(duration,Math.ceil(next+4));
+      if(isTail)from=Math.max(0,Math.min(from,duration-35));
+      if(to-from>52){
+        // Center on the missing speech; don't convert a 60s hole into
+        // an unsafe and expensive unlimited video request.
+        const mid=(cursor+next)/2;
+        from=Math.max(0,Math.floor(mid-26));to=Math.min(duration,from+52);
+      }
+      candidates.push({from,to,score:gap+(isHead?28:isTail?15:cursor>=60?10:3),label:isHead?'start':isTail?'end':'interior'});
+    }
+    if(i<ordered.length)cursor=Math.max(cursor,ordered[i].endSeconds);
+  }
+  candidates.sort((a,b)=>b.score-a.score||a.from-b.from);
+  const selected:VideoReviewWindow[]=[];
+  const append=(w:VideoReviewWindow)=>{
+    if(w.to-w.from<8||selected.some(s=>Math.max(0,Math.min(s.to,w.to)-Math.max(s.from,w.from))>=Math.min(s.to-s.from,w.to-w.from)*.65))return;
+    if(selected.length<3)selected.push({from:w.from,to:w.to});
+  };
+  for(const c of candidates)append(c);
+  // If no major gap is visible, retain the two middle independent checks;
+  // apparent coverage in raw Gemini text can still conceal missing clauses.
+  if(selected.length<2)for(const w of planSpeechCoverageWindows(duration))append(w);
+  return selected;
+}
