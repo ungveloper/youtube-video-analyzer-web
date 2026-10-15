@@ -164,14 +164,39 @@ export function planSpeechRepairWindows(lines:TranscriptLine[],duration:number):
     if(i<ordered.length)cursor=Math.max(cursor,ordered[i].endSeconds);
   }
   candidates.sort((a,b)=>b.score-a.score||a.from-b.from);
+  // Short omissions can hide behind nearly continuous timestamps. When a
+  // speaker begins with a sequencing/contrast cue, a previous counterpart
+  // may have been omitted even though there is no >=9s silent-looking gap.
+  // This only PLANS a real audio re-listen; no transcript words are invented.
+  const transition=ordered.flatMap((line,i)=>{
+    if(i===0||line.startSeconds<60||line.startSeconds>duration-12)return [];
+    const phrase=line.text.trim().replace(/^[\s"'“”]+/u,'');
+    if(!/^(?:그다음에|그 다음에|반면에|그에 반해|이에 비해|다음으로)(?:[\s,.!?]|$)/u.test(phrase))return [];
+    const pause=line.startSeconds-ordered[i-1].endSeconds;
+    if(pause<-.8||pause>9)return [];
+    const from=Math.max(0,Math.floor(line.startSeconds-14));
+    const to=Math.min(duration,Math.ceil(line.startSeconds+14));
+    return to-from>=22?[{from,to,score:Math.min(8,pause)+Math.min(7,line.text.length/15)}]:[];
+  }).sort((a,b)=>b.score-a.score||a.from-b.from)[0]??null;
   const selected:VideoReviewWindow[]=[];
   const append=(w:VideoReviewWindow)=>{
-    if(w.to-w.from<8||selected.some(s=>Math.max(0,Math.min(s.to,w.to)-Math.max(s.from,w.from))>=Math.min(s.to-s.from,w.to-w.from)*.65))return;
+    const length=w.to-w.from;
+    if(length<8)return;
+    // A 26-28s focused re-listen and a broader middle review serve different
+    // purposes: don't treat containment as duplication. Reject only near-
+    // identical windows with strong overlap in BOTH directions.
+    if(selected.some(s=>{
+      const overlap=Math.max(0,Math.min(s.to,w.to)-Math.max(s.from,w.from));
+      return overlap>=Math.min(s.to-s.from,length)*.75 && overlap>=Math.max(s.to-s.from,length)*.75;
+    }))return;
     if(selected.length<3)selected.push({from:w.from,to:w.to});
   };
+  // Existing large gaps remain highest priority. One focused transition
+  // review can occupy an otherwise unused slot, never >3 video calls.
   for(const c of candidates)append(c);
-  // If no major gap is visible, retain the two middle independent checks;
-  // apparent coverage in raw Gemini text can still conceal missing clauses.
-  if(selected.length<2)for(const w of planSpeechCoverageWindows(duration))append(w);
+  if(transition)append(transition);
+  // Preserve both pre-existing middle cross-check windows even when one short
+  // transition review was added. No transition => original two-call behavior.
+  if(selected.length<(transition?3:2))for(const w of planSpeechCoverageWindows(duration))append(w);
   return selected;
 }
