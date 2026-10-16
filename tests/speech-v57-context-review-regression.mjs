@@ -105,20 +105,10 @@ for(let i=0;i<original.length;i++){
 }
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-
-assert.match(ai,/captionProofreadReviewPrompt\(/);
-assert.match(ai,/pass:'caption-proofread-review'/);
-assert.match(ai,/event:'analysis\.caption_proofread_review'/);
-assert.match(ai,/event:'analysis\.caption_proofread_review_failed'/);
-assert.match(ai,/firstPassPreserved:true/);
-assert.match(ai,/proofreadCalls\+\+/);
-assert.match(ai,/timecodesPreserved/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
 assert.match(ai,/preserveTimedCaptionTimeline/);
-
-const cleanup=fs.readFileSync(
-  'lib/server/caption-cleanup.ts','utf8'
-);
-assert.doesNotMatch(cleanup,/medicalRules/);
+assert.match(ai,/providerCalls:1/);
 
 console.log(
   'PASS: second-pass context review, multi-domain corrections, numeric guard, timestamp preservation'

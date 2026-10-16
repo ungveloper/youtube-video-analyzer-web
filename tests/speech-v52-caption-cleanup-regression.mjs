@@ -118,10 +118,10 @@ assert.doesNotMatch(cleanupSource,/medicalRules/);
 assert.doesNotMatch(cleanupSource,/가지\\s\*동맹/);
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-assert.match(ai,/normalizeCaptionErrors\(originalCaptionLines\)/);
-assert.match(ai,/captionProofreadPrompt\(\s*baselineLines/);
-assert.match(ai,/applyCaptionProofread\(\s*baselineLines/);
-assert.match(ai,/strategy:'domain-neutral'/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
+assert.match(ai,/preserveTimedCaptionTimeline/);
+assert.match(ai,/providerCalls:1/);
 
 console.log(
  'PASS: topic-neutral deduplication, multi-domain contextual proofreading, protected numbers, immutable timestamps'

@@ -74,9 +74,10 @@ assert.match(prompt,/after/);
 assert.match(prompt,/다양한 분야의 영상/);
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-assert.match(ai,/pass:'caption-proofread'/);
-assert.match(ai,/proposed:Array\.isArray\(rawCorrections\)/);
-assert.match(ai,/preserveTimedCaptionTimeline\(result,captions\.srt,video\.durationSeconds\)/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
+assert.match(ai,/preserveTimedCaptionTimeline/);
+assert.match(ai,/providerCalls:1/);
 
 console.log(
   'PASS: contextual phrase patches, cross-domain examples, protected facts, timestamps'

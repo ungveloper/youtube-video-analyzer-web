@@ -50,14 +50,14 @@ assert.deepEqual(
 assert.match(article[0].title,/시간 지정 원문/);
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-assert.match(ai,/captionArticleFromEvidence\(source\.evidence\)/);
-assert.match(ai,/captionArticleFromEvidence\(captionEvidence\)/);
-assert.match(ai,/proofreadingFailure\?\.code==='FREE_LIMIT'/);
-assert.match(ai,/captionProofreadStatus=proofreadStatus/);
-assert.match(ai,/event:'analysis\.caption_article_fallback'/);
-assert.match(ai,/PROVIDER_BUSY'\]\.includes\(composeFailureCode\)/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
+assert.match(ai,/preserveTimedCaptionTimeline/);
+assert.match(ai,/providerCalls:1/);
 
-const ui=fs.readFileSync('components/analysis-workspace.tsx','utf8');
+const ui=fs.readFileSync(
+  'components/analysis-workspace.tsx','utf8'
+);
 assert.match(ui,/자막 기본 정리/);
 assert.match(ui,/시간 지정 자막은 확보했지만/);
 

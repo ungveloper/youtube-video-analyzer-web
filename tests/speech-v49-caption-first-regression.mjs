@@ -54,6 +54,6 @@ assert.equal(await mocked.fetchYtDlpKoreanCaptions('notvalid',202),null,'Never p
 assert(!src.includes('디스크 탈출증'),'Production code must not hardcode a video transcript');
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
 assert.match(ai,/fetchYtDlpKoreanCaptions\(video\.id,video\.durationSeconds,signal\)/);
-assert.match(ai,/preserveTimedCaptionTimeline\(result,captions\.srt,video\.durationSeconds\)/);
+assert.match(ai,/preserveTimedCaptionTimeline\(\s*result,\s*captions\.srt,\s*video\.durationSeconds\s*\)/);
 assert.match(ai,/event:'analysis\.caption_first_fallback'/);
 console.log('PASS: LiveWiki 28 timed cues, video-independent VTT conversion, no Gemini rewrite, 429 caption-only fallback wired');

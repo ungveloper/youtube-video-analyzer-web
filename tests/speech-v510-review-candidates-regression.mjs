@@ -86,12 +86,10 @@ for(let i=0;i<lines.length;i++){
 }
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-assert.match(
-  ai,/captionProofreadReviewPrompt\(\s*baselineLines,video\.title,\s*reviewed\.parsed/
-);
-assert.match(ai,/firstPassAccepted/);
-assert.match(ai,/reviewMode:'candidate-verification'/);
-assert.match(ai,/event:'analysis\.caption_consensus'/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
+assert.match(ai,/preserveTimedCaptionTimeline/);
+assert.match(ai,/providerCalls:1/);
 
 console.log(
  'PASS: review receives original candidates, validates individually, preserves timestamps'

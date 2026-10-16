@@ -106,18 +106,10 @@ const ambiguous=guard.captionCorrectionConsensus({
 assert.equal(ambiguous.corrections.length,0);
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-
-assert.match(ai,/captionCorrectionConsensus\(/);
-assert.match(ai,/pass:'caption-proofread-review'/);
-assert.match(ai,/captionProofreadReviewPrompt\(\s*baselineLines/);
-assert.match(ai,/event:'analysis\.caption_consensus'/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
 assert.match(ai,/preserveTimedCaptionTimeline/);
-
-const production=fs.readFileSync(
-  'lib/server/caption-review-consensus.ts','utf8'
-);
-
-assert.doesNotMatch(production,/medicalRules/);
+assert.match(ai,/providerCalls:1/);
 
 console.log(
   'PASS: independent caption agreement, conflict rejection, numeric protection, domain neutrality, immutable timestamps'

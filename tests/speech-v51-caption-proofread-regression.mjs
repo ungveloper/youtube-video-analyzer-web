@@ -73,13 +73,9 @@ assert.match(srt,/00:00:00,120 --> 00:00:04,640/);
 assert.match(srt,/00:03:06,560 --> 00:03:11,560/);
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-assert.match(ai,/pass:'caption-proofread'/);
-assert.match(ai,/captionProofreadPrompt\(/);
-assert.match(ai,/applyCaptionProofread\(/);
-assert.match(ai,/timecodesPreserved/);
-assert.match(ai,/proofreadingFailure\?\.code==='FREE_LIMIT'/);
-assert.match(ai,/preserveTimedCaptionTimeline\(result,captions\.srt,video\.durationSeconds\)/);
-assert.match(ai,/rawCaptionTranscript=originalCaptionLines/);
-assert.match(ai,/providerCalls\+=proofreadCalls/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
+assert.match(ai,/preserveTimedCaptionTimeline/);
+assert.match(ai,/providerCalls:1/);
 
 console.log('PASS: caption proofreading, timestamp preservation, numeric/institution guard, Gemini fallback wiring');

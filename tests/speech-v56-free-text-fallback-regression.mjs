@@ -32,13 +32,9 @@ assert.equal(choose('gemini-3.8-flash','FREE_LIMIT'),null);
 assert.equal(choose('gemini-3.5-flash-lite','PROVIDER_BUSY'),null);
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
-
-assert.match(ai,/analysis\.caption_proofread_free_fallback/);
-assert.match(ai,/analysis\.article_free_model_fallback/);
-assert.match(ai,/deepAnalysis\(video,captionModel/);
-assert.match(ai,/model:articleModel/);
-assert.match(ai,/timeoutMs:provided\?70000:125000/);
-assert.match(ai,/proofreadingFailure\?\.code==='FREE_LIMIT'/);
-assert.match(ai,/captionArticleFromEvidence\(captionEvidence\)/);
+assert.match(ai,/pass:'caption-single-pass'/);
+assert.match(ai,/captionOneCallPrompt\(/);
+assert.match(ai,/preserveTimedCaptionTimeline/);
+assert.match(ai,/providerCalls:1/);
 
 console.log('PASS: Gemini 무료 모델 장애 복구');
