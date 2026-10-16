@@ -7,7 +7,13 @@ export type AnalysisRecord = {
   rawCaptionTranscript?: TranscriptLine[];
   id: string; video: VideoInfo; createdAt: string; updatedAt: string; model: string;
   evidence: Evidence[]; original: AnalysisContent; edited: AnalysisContent;
-  analysisMeta?: { videoProcessing?: 'static' | 'agentic' | 'captions'; elapsedMs?: number; inputTokens?: number; outputTokens?: number; depth: 'standard' | 'deep'; providerCalls: number; refinement: 'improved' | 'kept-first' | 'not-needed'; pipeline?: 'single-pass' | 'evidence-compose'; sourceClaims?: number; sourceEvidence?: number; sourceMode?: 'user-captions' | 'public-captions' | 'video-url'; qualityStatus?: 'review' | 'partial'; coveragePercent?: number; sourceEndPercent?: number; articleChars?: number; composeFailureCode?: string; composeRecovery?: 'article-only' };
+  analysisMeta?: { videoProcessing?: 'static' | 'agentic' | 'captions'; elapsedMs?: number; inputTokens?: number; outputTokens?: number; depth: 'standard' | 'deep'; providerCalls: number; refinement: 'improved' | 'kept-first' | 'not-needed'; pipeline?: 'single-pass' | 'evidence-compose'; sourceClaims?: number; sourceEvidence?: number; sourceMode?: 'user-captions' | 'public-captions' | 'video-url'; qualityStatus?: 'review' | 'partial'; coveragePercent?: number; sourceEndPercent?: number; articleChars?: number; composeFailureCode?: string; composeRecovery?: 'article-only';
+    captionProofreadStatus?: 'skipped'|'applied'|'unchanged'|'failed';
+    captionProofreadAccepted?: number;
+    captionProofreadProposed?: number;
+    captionProofreadCode?: string;
+    captionLocalCorrections?: number;
+  };
 };
 export type ApiError = { error: string; code?: string; remaining?: number };
 export type QuotaInfo = { remaining: number; completed: number; reserved: number; limit: number; enabled: boolean; reason?: string };

@@ -77,7 +77,7 @@ assert.match(ai,/pass:'caption-proofread'/);
 assert.match(ai,/captionProofreadPrompt\(/);
 assert.match(ai,/applyCaptionProofread\(/);
 assert.match(ai,/timecodesPreserved/);
-assert.match(ai,/if\(proofreadingFailure\)throw proofreadingFailure/);
+assert.match(ai,/proofreadingFailure\?\.code==='FREE_LIMIT'/);
 assert.match(ai,/preserveTimedCaptionTimeline\(result,captions\.srt,video\.durationSeconds\)/);
 assert.match(ai,/rawCaptionTranscript=originalCaptionLines/);
 assert.match(ai,/providerCalls\+=proofreadCalls/);

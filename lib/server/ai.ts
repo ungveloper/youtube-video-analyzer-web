@@ -7,6 +7,7 @@ import { googleErrorDetail,googleErrorMessage } from '@/lib/server/google-error'
 import { assessDetail, detailTargets } from '@/lib/analysis-detail';
 import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource, focusedTailPrompt, mergeFocusedTail } from '@/lib/server/evidence-pipeline';
 import { sourceFromUserCaptions, timelineFromProvidedCaptions } from '@/lib/server/caption-source';
+import {captionArticleFromEvidence} from '@/lib/server/caption-article-fallback';
 import { assessSourceCoverage, assessSinglePassCoverage } from '@/lib/quality-audit';
 import { timelineFromSourceClaims, timelineFromEvidenceNotes, appendUnreferencedEvidenceNotes } from '@/lib/timeline-granularity';
 import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/temporal-coverage';
@@ -257,7 +258,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     // A narrow article-only retry is easier for a provider to satisfy than a
     // three-document structured response. It uses text evidence, never a new video call.
     // Do not retry a quota, permissions, or cancellation error.
-    const retryable=!provided && ['TEMPORARY_HTTP','TIMEOUT','INVALID_RESULT'].includes(composeFailureCode);
+    const retryable=['TEMPORARY_HTTP','TIMEOUT','INVALID_RESULT','PROVIDER_BUSY'].includes(composeFailureCode);
     if(retryable){
       onProgress({type:'progress',step:3,attempt:sourceCalls+2,label:'아티클 전용 복구 시도',detail:'전체 문서 요청이 실패해 더 작은 아티클 전용 요청을 한 번만 시도합니다. 무료 요청을 추가 사용합니다.'});
       try {
@@ -275,8 +276,28 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
         console.warn(JSON.stringify({event:'analysis.article_recovery_failed',requestId,model,code:recoveryError instanceof ServiceError?recoveryError.code:'INVALID_OR_TIMEOUT'}));
       }
     }
-    if(!composed)onProgress({type:'progress',step:3,label:'상세 문서 생성 실패',detail:'제공자가 작성 요청을 처리하지 못해 근거 메모만 제공합니다. 재호출하지 않습니다.'});
+    if(!composed)onProgress({type:'progress',step:3,label:'AI 상세 문서 생성 실패',detail:'시간 지정 원문이 확보된 경우 전체 자막을 원문 문단으로 복구합니다.'});
   }
+  if(provided && !composed){
+    content={
+      ...content,
+      article:captionArticleFromEvidence(source.evidence),
+      exclusions:[
+        ...content.exclusions.filter(
+          s=>!s.includes('상세 아티클 작성에 실패했습니다.')
+        ),
+        'AI 작성 요청이 실패했습니다. 아티클 영역에는 확보한 자막을 시간순으로 연결한 원문 문단을 표시합니다. AI가 작성한 해설문은 아닙니다.'
+      ]
+    };
+    console.info(JSON.stringify({
+      event:'analysis.caption_article_fallback',
+      requestId,
+      articleSections:content.article.length,
+      sourceEvidence:source.evidence.length,
+      composeFailureCode
+    }));
+  }
+
   // A successful response may still omit an article or provide only a stub.
   // Try one bounded article-only composition without discarding already good
   // summary/timeline sections; never call the video URL a second time.
@@ -313,7 +334,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   if(composeRecovery)audit.qualityStatus='partial';
   // Sparse time coverage is a review warning in the timeline UI, not an excluded fact.
   if(composeRecovery)content.exclusions.push('복구된 아티클은 원본 근거를 사용했으나 요약·타임라인은 1차 근거 메모입니다. 전체 상세 분석으로 확정하지 않았습니다.');
-  if(audit.articleIncomplete) content.exclusions.push(composed?'아티클이 상세도 기준에 미치지 못합니다. 근거만으로 충분한 설명을 생성하지 못했습니다.':'2차 아티클 생성 실패: 아티클은 제공하지 않고 1차 근거 메모만 보여줍니다.');
+  if(audit.articleIncomplete) content.exclusions.push(composed?'아티클이 상세도 기준에 미치지 못합니다. 근거만으로 충분한 설명을 생성하지 못했습니다.':provided?'AI 아티클 작성에 실패해 시간 지정 원문을 문단으로 복구했습니다. 자동 작성된 해설문이 아닙니다.':'2차 아티클 생성 실패: 아티클은 제공하지 않고 1차 근거 메모만 보여줍니다.');
   if(audit.qualityStatus==='partial') content.exclusions.push('부분 분석으로 분류했습니다. 실제 영상과 대조하여 누락된 내용을 확인하세요.');
   const result=recordFromContent(video,model,source.evidence,content);
   result.analysisMeta={depth:'deep',videoProcessing:provided?'captions':videoProcessing,elapsedMs:Date.now()-analysisStarted,providerCalls:sourceCalls+compositionCalls,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length, sourceMode:provided?'user-captions':'video-url', qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,articleChars:audit.articleChars,composeFailureCode,composeRecovery};
@@ -630,6 +651,10 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       let proofreadCalls=0;
       let appliedCorrections=localCorrections;
       let proofreadingFailure:ServiceError|null=null;
+      let proofreadStatus:'skipped'|'applied'|'unchanged'|'failed'='skipped';
+      let proofreadAccepted=0;
+      let proofreadProposed=0;
+      let proofreadCode:string|undefined;
 
       if(originalCaptionLines.length>=3 &&
          originalCaptionLines.length<=250 &&
@@ -696,6 +721,15 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
               ?(reviewed.parsed as {corrections?:unknown}).corrections
               :undefined;
 
+          proofreadProposed=Array.isArray(rawCorrections)
+            ?rawCorrections.length:0;
+          proofreadAccepted=timecodesPreserved?fixed.accepted:0;
+          proofreadStatus=timecodesPreserved
+            ?fixed.accepted>0?'applied':'unchanged'
+            :'failed';
+          if(!timecodesPreserved)
+            proofreadCode='TIMECODE_REJECTED';
+
           console.info(JSON.stringify({
             event:'analysis.caption_proofread',
             requestId,model,
@@ -713,6 +747,9 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
 
           const code=error instanceof ServiceError
             ?error.code:'INVALID_RESULT';
+
+          proofreadStatus='failed';
+          proofreadCode=code;
 
           console.warn(JSON.stringify({
             event:'analysis.caption_proofread_failed',
@@ -732,7 +769,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       const captionLines=parseTimedCaptionSrt(captions.srt,video.durationSeconds);
       const captionEvidence=captionLines.map((l,i)=>({id:`timed-caption-e-${i}`,startSeconds:l.startSeconds,endSeconds:l.endSeconds,kind:'caption' as const,note:l.text}));
       try{
-        if(proofreadingFailure)throw proofreadingFailure;
+        if(proofreadingFailure?.code==='FREE_LIMIT')throw proofreadingFailure;
         const result=await deepAnalysis(video,model,key,requestId,onProgress,signal,captions.srt,videoProcessing,retryOnBusy);
         const preserved=preserveTimedCaptionTimeline(result,captions.srt,video.durationSeconds);
         console.info(JSON.stringify({event:'analysis.caption_first',requestId,cues:preserved,end:captions.end,source:'timed-youtube-caption'}));
@@ -740,6 +777,11 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
           result.analysisMeta.sourceMode='public-captions';
           result.analysisMeta.depth=depth;
           result.analysisMeta.providerCalls+=proofreadCalls;
+          result.analysisMeta.captionProofreadStatus=proofreadStatus;
+          result.analysisMeta.captionProofreadAccepted=proofreadAccepted;
+          result.analysisMeta.captionProofreadProposed=proofreadProposed;
+          result.analysisMeta.captionProofreadCode=proofreadCode;
+          result.analysisMeta.captionLocalCorrections=localCorrections;
         }
         if(appliedCorrections>0)
           result.rawCaptionTranscript=originalCaptionLines;
@@ -750,12 +792,12 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         if(!['FREE_LIMIT','PROVIDER_BUSY','TIMEOUT'].includes(code)||captionLines.length<3)throw error;
         // Captions have already been read from YouTube. Even if Gemini's
         // article call is throttled, keep a transparent caption-only result.
-        const content:AnalysisContent={summary:[],article:[],timeline:captionLines.map((l,i)=>({id:`timed-caption-t-${i}`,text:l.text,evidenceIds:[captionEvidence[i].id]})),transcript:captionLines,exclusions:[`Google AI 요약·아티클 요청 실패(${code}). YouTube에서 확보한 시간 지정 자막 ${captionLines.length}개만 표시합니다. 자막 시각은 YouTube 제공값이며 별도 음성 검증은 하지 않았습니다.`]};
+        const content:AnalysisContent={summary:[],article:captionArticleFromEvidence(captionEvidence),timeline:captionLines.map((l,i)=>({id:`timed-caption-t-${i}`,text:l.text,evidenceIds:[captionEvidence[i].id]})),transcript:captionLines,exclusions:[`Google AI 교정 또는 작성 요청 실패(${code}). 확보된 시간 지정 자막 ${captionLines.length}개로 원문 문단을 구성했습니다. AI가 작성한 완성 아티클은 아니며 실제 음성 검증은 하지 않았습니다.`]};
         const fallback=recordFromContent(video,model,captionEvidence,content);
-        fallback.analysisMeta={depth,videoProcessing:'captions',providerCalls:proofreadCalls+(proofreadingFailure?0:1),refinement:'kept-first',pipeline:'single-pass',sourceMode:'public-captions',qualityStatus:'partial'};
+        fallback.analysisMeta={depth,videoProcessing:'captions',providerCalls:proofreadCalls+(proofreadingFailure?0:1),refinement:'kept-first',pipeline:'single-pass',sourceMode:'public-captions',qualityStatus:'partial',captionProofreadStatus:proofreadStatus,captionProofreadAccepted:proofreadAccepted,captionProofreadProposed:proofreadProposed,captionProofreadCode:proofreadCode,captionLocalCorrections:localCorrections,composeFailureCode:code};
         if(appliedCorrections>0)
           fallback.rawCaptionTranscript=originalCaptionLines;
-        console.warn(JSON.stringify({event:'analysis.caption_first_fallback',requestId,code,captionLines:captionLines.length,articleGenerated:false}));
+        console.warn(JSON.stringify({event:'analysis.caption_first_fallback',requestId,code,captionLines:captionLines.length,articleGenerated:false,captionArticleSections:content.article.length}));
         return fallback;
       }
     }
