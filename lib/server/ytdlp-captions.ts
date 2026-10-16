@@ -35,12 +35,88 @@ function plain(raw:string):string{
     .replace(/\s+/g,' ').trim();
 }
 
-/** Preserve the provider's real cue boundaries and chronology. Only collapse
- * adjacent EXACT/CONTAINED rolling YouTube VTT cues; never synthesize words. */
+type CaptionCue={start:number;end:number;text:string};
+
+/** YouTube automatic VTT often repeats the PREVIOUS subtitle line at the
+ * beginning of the next cue: A+B, then B+C, then C+D. Matching a complete
+ * cue (or startsWith) does not detect this rolling suffix/prefix repetition.
+ * Require an exact multi-word overlap, never topical/fuzzy similarities.
+ */
+function rollingOverlap(previous:string,current:string):number{
+  if(previous===current)return current.length;
+  if(previous.includes(current) && current.length>=10)return current.length;
+  const limit=Math.min(previous.length,current.length,250);
+  for(let n=limit;n>=10;n--){
+    const overlap=current.slice(0,n);
+    if(!/\s/u.test(overlap))continue; // a single common word is not evidence
+    if(previous.endsWith(overlap))return n;
+  }
+  return 0;
+}
+
+/** Preserve a normal human-edited subtitle track byte-for-byte in its words.
+ * For a genuinely rolling track, use each newly revealed suffix exactly once
+ * and group the incremental speech at sentence endings / reasonable spans.
+ * All boundaries are derived from existing VTT cues, never AI estimates.
+ */
+function compactRollingCues(raw:CaptionCue[]):CaptionCue[]{
+  if(raw.length<8)return raw;
+  let overlaps=0,considered=0;
+  for(let i=1;i<raw.length;i++){
+    const a=raw[i-1],b=raw[i];
+    if(b.start-a.start>8)continue;
+    considered++;
+    if(rollingOverlap(a.text,b.text)>=10)overlaps++;
+  }
+  // Avoid rewriting ordinary caption tracks with an occasional repeated word.
+  if(overlaps<4 || overlaps/Math.max(1,considered)<.35)return raw;
+
+  const pieces:CaptionCue[]=[];
+  for(let i=0;i<raw.length;i++){
+    const current=raw[i],prev=raw[i-1];
+    const overlap=prev&&current.start-prev.start<=8 ? rollingOverlap(prev.text,current.text) : 0;
+    const added=overlap?current.text.slice(overlap).trim():current.text;
+    if(!added){if(pieces.length)pieces[pieces.length-1].end=Math.max(pieces[pieces.length-1].end,current.end);continue;}
+    pieces.push({start:current.start,end:current.end,text:added});
+  }
+  const merged:CaptionCue[]=[];
+  let open:CaptionCue|null=null;
+  const flush=()=>{if(open && open.text.trim())merged.push(open);open=null;};
+  for(const piece of pieces){
+    // Timestamp is allocated within this existing displayed cue, for ordering
+    // only. Word-level timing is an approximation; no new speech is written.
+    const words=piece.text.split(/\s+/).filter(Boolean);
+    for(let j=0;j<words.length;j++){
+      const start=piece.start+(piece.end-piece.start)*j/words.length;
+      const end=piece.start+(piece.end-piece.start)*(j+1)/words.length;
+      if(open && start-open.end>3)flush();
+      if(!open)open={start,end,text:words[j]};
+      else {open.text+=' '+words[j];open.end=Math.max(open.end,end);}
+      const span=end-open.start;
+      const fullSentence=/[.!?。！？]["'”’)]?$/u.test(words[j]);
+      // The transcript is editorially grouped only; the words remain exactly
+      // those first observed in the video caption cues, in original order.
+      if((fullSentence && (open.text.length>=23 || span>=3)) ||
+         (span>=14 && open.text.length>=48) || open.text.length>=165)flush();
+    }
+  }
+  flush();
+  // Raw captions can overlap in display-time while their spoken content is
+  // sequential. Clamp the previous end to the next existing start, but never
+  // invent missing start timestamps.
+  for(let i=0;i+1<merged.length;i++){
+    if(merged[i+1].start>merged[i].start+.01)
+      merged[i].end=Math.min(merged[i].end,merged[i+1].start);
+  }
+  return merged.filter(x=>x.end>x.start);
+}
+
+/** Parse YouTube VTT, including rolling auto captions. Full human cues are
+ * preserved; rolling subtitles are compacted before turning them into SRT. */
 export function vttToSrt(vtt:string,duration:number):TimedCaptionResult|null{
   if(!vtt||vtt.length>MAX_BYTES)return null;
   const blocks=vtt.replace(/^\uFEFF/,'').replace(/\r/g,'').split(/\n\s*\n/g);
-  const cues:Array<{start:number;end:number;text:string}>=[];
+  const raw:CaptionCue[]=[];
   for(const block of blocks){
     const lines=block.trim().split('\n');
     const pos=lines.findIndex(l=>l.includes('-->'));
@@ -50,19 +126,25 @@ export function vttToSrt(vtt:string,duration:number):TimedCaptionResult|null{
     const start=seconds(match[1]),end=seconds(match[2]);
     if(!Number.isFinite(start)||!Number.isFinite(end)||start<0||end<=start||end>duration+1.5)continue;
     const text=plain(lines.slice(pos+1).join(' '));
-    if(!text)continue;
+    if(text)raw.push({start,end,text});
+  }
+  raw.sort((a,b)=>a.start-b.start||a.end-b.end);
+  const rolling=compactRollingCues(raw);
+  if(raw.length>=12 && rolling.length<=raw.length*.8)
+    console.info(JSON.stringify({event:'analysis.youtube_rolling_caption_normalized',sourceCues:raw.length,normalizedCues:rolling.length}));
+  // Keep the v4.9 exact/contained normalization for non-rolling subtitles.
+  // This also preserves all historical v4.9 caption regression expectations.
+  const cues:CaptionCue[]=[];
+  for(const c of rolling){
     const prev=cues.at(-1);
-    if(prev && start<=prev.end+1 && (prev.text===text||text.startsWith(prev.text))){
-      if(text.length>prev.text.length)prev.text=text;
-      prev.end=Math.max(prev.end,end);
-      continue;
+    if(prev && c.start<=prev.end+1 && (prev.text===c.text||c.text.startsWith(prev.text))){
+      if(c.text.length>prev.text.length)prev.text=c.text;
+      prev.end=Math.max(prev.end,c.end);continue;
     }
-    // An already displayed longer rolling cue may contain its late fragment.
-    if(prev && start<=prev.end+.5 && prev.text.includes(text) && text.length>=7){prev.end=Math.max(prev.end,end);continue;}
-    cues.push({start,end,text});
+    if(prev && c.start<=prev.end+.5 && prev.text.includes(c.text) && c.text.length>=7){prev.end=Math.max(prev.end,c.end);continue;}
+    cues.push({...c});
   }
   if(!cues.length)return null;
-  cues.sort((a,b)=>a.start-b.start||a.end-b.end);
   const srt=cues.map((c,i)=>`${i+1}\n${clock(c.start)} --> ${clock(c.end)}\n${c.text}`).join('\n\n')+'\n';
   return {srt,count:cues.length,end:Math.max(...cues.map(c=>c.end))};
 }
