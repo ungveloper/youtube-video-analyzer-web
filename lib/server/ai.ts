@@ -26,6 +26,7 @@ import {
   correctedLinesToSrt
 } from '@/lib/server/caption-proofread';
 import {normalizeCaptionErrors} from '@/lib/server/caption-cleanup';
+import {captionCorrectionConsensus} from '@/lib/server/caption-review-consensus';
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
@@ -766,7 +767,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
                 input:[{
                   type:'text',
                   text:captionProofreadReviewPrompt(
-                    fixed.lines,video.title
+                    baselineLines,video.title
                   )
                 }],
                 signal,
@@ -787,18 +788,37 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
               reviewProposed=Array.isArray(proposed)
                 ?proposed.length:0;
 
-              const second=applyCaptionProofread(
-                fixed.lines,review.parsed
+              const agreement=captionCorrectionConsensus(
+                reviewed.parsed,
+                review.parsed
               );
 
-              reviewAccepted=second.accepted;
-              reviewRejected=second.rejected;
+              // Apply only concordant semantic changes to
+              // the original baseline, not a previous AI draft.
+              const confirmed=applyCaptionProofread(
+                baselineLines,
+                {corrections:agreement.corrections}
+              );
+
+              reviewAccepted=confirmed.accepted;
+              reviewRejected=
+                confirmed.rejected+agreement.withheld;
 
               fixed={
-                lines:second.lines,
-                accepted:fixed.accepted+second.accepted,
-                rejected:fixed.rejected+second.rejected
+                lines:confirmed.lines,
+                accepted:confirmed.accepted,
+                rejected:fixed.rejected+reviewRejected
               };
+
+              console.info(JSON.stringify({
+                event:'analysis.caption_consensus',
+                requestId,
+                primaryProposed:agreement.primaryProposed,
+                reviewProposed:agreement.reviewProposed,
+                accepted:confirmed.accepted,
+                withheld:agreement.withheld,
+                strategy:'independent-text-agreement'
+              }));
 
               console.info(JSON.stringify({
                 event:'analysis.caption_proofread_review',
