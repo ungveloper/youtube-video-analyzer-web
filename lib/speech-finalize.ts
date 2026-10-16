@@ -74,6 +74,55 @@ function duplicates(a:TranscriptLine,b:TranscriptLine):boolean{
   return false;
 }
 
+/** The same sentence can be restamped up to ~40 seconds early by an
+ * independently estimated video clip. Only an unfinished QUOTE FRAGMENT
+ * may be suppressed at that distance, against a much fuller later quote.
+ * Full sentences repeated far apart are genuine evidence, not duplicates.
+ */
+function distantFragmentEcho(a:TranscriptLine,b:TranscriptLine):boolean{
+  const distance=Math.abs(a.startSeconds-b.startSeconds);
+  if(distance<=14||distance>55)return false;
+  const shorter=normalize(a.text).length<=normalize(b.text).length?a:b;
+  const fuller=shorter===a?b:a;
+  const x=normalize(shorter.text),y=normalize(fuller.text);
+  if(x.length<18||y.length<x.length+12||x.length/y.length>.82)return false;
+  // Never move a verified complete, clearly standalone phrase to a new time.
+  if(/[.!?。！？]\s*$/.test(shorter.text))return false;
+  const passage=sharedSpan(x,y).length;
+  const contentAgreement=passage>=15&&passage/x.length>=.57&&sequenceCoverage(x,y)>=.82;
+  const leftSource=/^(?:segment|salvaged)-(\d+)-/.exec(shorter.id)?.[1];
+  const rightSource=/^(?:segment|salvaged)-(\d+)-/.exec(fuller.id)?.[1];
+  const sameSource=leftSource!==undefined&&leftSource===rightSource;
+  // Independent neighboring listens commonly repeat the same words. Two
+  // separate complete statements or unrelated clauses must both survive.
+  return contentAgreement && !sameSource;
+}
+
+/** Remove a recognizer's short trailing echo without deleting real speech.
+ * This requires a near-identical sentence ending (not general similarity).
+ */
+function localTailEcho(a:TranscriptLine,b:TranscriptLine):boolean{
+  if(Math.abs(a.startSeconds-b.startSeconds)>13)return false;
+  const shorter=normalize(a.text).length<=normalize(b.text).length?a:b;
+  const fuller=shorter===a?b:a;
+  const x=normalize(shorter.text),y=normalize(fuller.text);
+  if(x.length<7||x.length>34||y.length<=x.length+6)return false;
+  // A short phrase can be an independently spoken sentence. Suppress only
+  // almost all of its words appearing in a longer nearby source quotation.
+  const longest=sharedSpan(x,y).length;
+  if(longest>=9 && longest/x.length>=.76 && sequenceCoverage(x,y)>=.88)return true;
+  // A tiny, one-syllable mistranscribed repeat of the PREVIOUS sentence's
+  // ending ("...이 되겠습니다") should not become another timestamp.
+  // Require the same final 7+ normalized characters, an immediately nearby
+  // longer source phrase, and near-total ordered character agreement.
+  if(x.length>=7&&x.length<=14&&y.length>=x.length+12&&
+    Math.abs(a.startSeconds-b.startSeconds)<=8){
+    const suffix=x.slice(-Math.min(8,x.length-1));
+    if(suffix.length>=6&&y.endsWith(suffix)&&sequenceCoverage(x,y)>=.75)return true;
+  }
+  return false;
+}
+
 /** Join ONLY a literal trailing phrase repeated at the start of the next
  * utterance. Unlike generic sentence merging, no unseen word is introduced.
  * Source text must be auditable: A + the non-overlapping suffix of B.
@@ -152,7 +201,7 @@ export function finalizeSpeechTimeline(input:TranscriptLine[],duration:number):F
   const ranked=stitched.map((l,i)=>({l,i})).sort((a,b)=>score(b.l)-score(a.l)||a.l.startSeconds-b.l.startSeconds);
   const kept:TranscriptLine[]=[];
   for(const {l} of ranked){
-    if(kept.some(existing=>duplicates(existing,l)))continue;
+    if(kept.some(existing=>duplicates(existing,l)||distantFragmentEcho(existing,l)||localTailEcho(existing,l)))continue;
     kept.push(l);
   }
   kept.sort((a,b)=>a.startSeconds-b.startSeconds||a.endSeconds-b.endSeconds);
