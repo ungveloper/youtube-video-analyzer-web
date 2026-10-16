@@ -107,7 +107,7 @@ assert.equal(corrected.lines[2].text,finance[2].text);
 const prompt=proof.captionProofreadPrompt(
   finance,'금융과 생활용품 리뷰'
 );
-assert.match(prompt,/모든 분야/);
+assert.match(prompt,/(?:모든 분야|주제에 관계없이)/);
 assert.match(prompt,/전체 자막/);
 assert.match(prompt,/금융과 생활용품 리뷰/);
 

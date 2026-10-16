@@ -657,7 +657,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
               )
             }],
             signal,
-            timeoutMs:50000,
+            timeoutMs:75000,
             thinkingLevel:'medium',
             maxOutputTokens:Math.min(
               9000,
@@ -690,9 +690,17 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
             appliedCorrections+=fixed.accepted;
           }
 
+          const rawCorrections=
+            reviewed.parsed &&
+            typeof reviewed.parsed==='object'
+              ?(reviewed.parsed as {corrections?:unknown}).corrections
+              :undefined;
+
           console.info(JSON.stringify({
             event:'analysis.caption_proofread',
             requestId,model,
+            proposed:Array.isArray(rawCorrections)
+              ?rawCorrections.length:null,
             cues:originalCaptionLines.length,
             accepted:timecodesPreserved?fixed.accepted:0,
             rejected:fixed.rejected,
