@@ -28,6 +28,11 @@ import {
 } from '@/lib/server/caption-one-call';
 import {normalizeCaptionErrors} from '@/lib/server/caption-cleanup';
 import {
+  guardCaptionCorrections,
+  repairCaptionConjunctionSpacing,
+  auditCaptionReconciliation
+} from '@/lib/server/caption-edit-guard';
+import {
   repairCaptionQuotationParticles,
   reconcileCaptionSource
 } from '@/lib/server/caption-context-reconcile';
@@ -725,8 +730,11 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         const proposed=Array.isArray(raw)
           ?raw.length:0;
 
-        const fixed=applyCaptionProofread(
+        const guarded=guardCaptionCorrections(
           baselineLines,response.parsed
+        );
+        const fixed=applyCaptionProofread(
+          baselineLines,guarded.parsed
         );
 
         // Conservative, domain-neutral repair of a particle
@@ -734,13 +742,16 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         const syntactic=repairCaptionQuotationParticles(
           baselineLines,fixed.lines
         );
-        const grammarAdjusted=syntactic.reduce(
+        const safeLines=repairCaptionConjunctionSpacing(
+          syntactic
+        );
+        const grammarAdjusted=safeLines.reduce(
           (count,line,i)=>
             count+(line.text!==fixed.lines[i].text?1:0),0
         );
 
         const candidate=fixed.accepted+grammarAdjusted>0
-          ?correctedLinesToSrt(syntactic)
+          ?correctedLinesToSrt(safeLines)
           :captions.srt;
 
         const verified=parseTimedCaptionSrt(
@@ -769,6 +780,9 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         // verified corrected captions, without new timecodes.
         const correctedSource=reconcileCaptionSource(
           source,verified
+        );
+        const evidenceAudit=auditCaptionReconciliation(
+          source,correctedSource,verified
         );
         const correctedEvidence=originalEvidence.map(
           (entry,i)=>({...entry,note:verified[i].text})
@@ -811,6 +825,11 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
             'Gemini의 핵심 요약 결과에서 유효한 근거 연결을 확인하지 못했습니다.'
           );
 
+        if(!evidenceAudit.synchronized)
+          content.exclusions.push(
+            '교정된 자막과 근거 메모 일부가 일치하지 않아 결과를 추가 검토해야 합니다.'
+          );
+
         // Timeline and transcript are built from corrected timed cues,
         // never from fabricated model timestamps.
         const result=recordFromContent(
@@ -833,7 +852,8 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
           sourceMode:'public-captions',
           sourceClaims:correctedSource.claims.length,
           sourceEvidence:correctedSource.evidence.length,
-          qualityStatus:composed?'review':'partial',
+          qualityStatus:composed&&evidenceAudit.synchronized
+            ?'review':'partial',
           articleChars:content.article.reduce(
             (n,item)=>n+item.text.length,0
           ),
@@ -863,7 +883,14 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
           rejected:fixed.rejected,
           localCorrections,
           grammarAdjusted,
-          evidenceSynced:correctedSource!==source,
+          blockedSpacing:guarded.blockedSpacing,
+          evidenceSynced:evidenceAudit.evidenceChanged>0 &&
+            evidenceAudit.synchronized,
+          evidenceSyncValid:evidenceAudit.synchronized,
+          evidenceChanged:evidenceAudit.evidenceChanged,
+          claimChanged:evidenceAudit.claimChanged,
+          transcriptChanged:evidenceAudit.transcriptChanged,
+          evidenceGroupsChecked:evidenceAudit.groupsChecked,
           timecodesPreserved,
           summary:content.summary.length,
           article:content.article.length,
