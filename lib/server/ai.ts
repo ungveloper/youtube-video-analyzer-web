@@ -737,6 +737,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
             baselineLines,
             reviewed.parsed
           );
+          const firstPassAccepted=fixed.accepted;
 
           let reviewProposed=0;
           let reviewAccepted=0;
@@ -767,7 +768,8 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
                 input:[{
                   type:'text',
                   text:captionProofreadReviewPrompt(
-                    baselineLines,video.title
+                    baselineLines,video.title,
+                    reviewed.parsed
                   )
                 }],
                 signal,
@@ -814,6 +816,8 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
                 event:'analysis.caption_consensus',
                 requestId,
                 primaryProposed:agreement.primaryProposed,
+                firstPassAccepted,
+                reviewMode:'candidate-verification',
                 reviewProposed:agreement.reviewProposed,
                 accepted:confirmed.accepted,
                 withheld:agreement.withheld,
