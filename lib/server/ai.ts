@@ -27,6 +27,10 @@ import {
   captionOneCallPrompt
 } from '@/lib/server/caption-one-call';
 import {normalizeCaptionErrors} from '@/lib/server/caption-cleanup';
+import {
+  repairCaptionQuotationParticles,
+  reconcileCaptionSource
+} from '@/lib/server/caption-context-reconcile';
 
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
@@ -725,8 +729,18 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
           baselineLines,response.parsed
         );
 
-        const candidate=fixed.accepted>0
-          ?correctedLinesToSrt(fixed.lines)
+        // Conservative, domain-neutral repair of a particle
+        // changed by a previously accepted noun replacement.
+        const syntactic=repairCaptionQuotationParticles(
+          baselineLines,fixed.lines
+        );
+        const grammarAdjusted=syntactic.reduce(
+          (count,line,i)=>
+            count+(line.text!==fixed.lines[i].text?1:0),0
+        );
+
+        const candidate=fixed.accepted+grammarAdjusted>0
+          ?correctedLinesToSrt(syntactic)
           :captions.srt;
 
         const verified=parseTimedCaptionSrt(
@@ -751,13 +765,22 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
 
         captions.srt=candidate;
 
+        // Reconcile the original evidence IDs with the now
+        // verified corrected captions, without new timecodes.
+        const correctedSource=reconcileCaptionSource(
+          source,verified
+        );
+        const correctedEvidence=originalEvidence.map(
+          (entry,i)=>({...entry,note:verified[i].text})
+        );
+
         let content:AnalysisContent;
         let composed=false;
 
         try{
           content=extractComposedContent(
             {...(response.parsed as object),timeline:[]},
-            source
+            correctedSource
           );
 
           composed=content.summary.length>0 &&
@@ -775,7 +798,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
 
         if(!content.article.length){
           content.article=captionArticleFromEvidence(
-            originalEvidence
+            correctedEvidence
           );
 
           content.exclusions.push(
@@ -791,7 +814,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         // Timeline and transcript are built from corrected timed cues,
         // never from fabricated model timestamps.
         const result=recordFromContent(
-          video,model,source.evidence,content
+          video,model,correctedSource.evidence,content
         );
 
         const preserved=preserveTimedCaptionTimeline(
@@ -808,17 +831,18 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
           refinement:'not-needed',
           pipeline:'single-pass',
           sourceMode:'public-captions',
-          sourceClaims:source.claims.length,
-          sourceEvidence:source.evidence.length,
+          sourceClaims:correctedSource.claims.length,
+          sourceEvidence:correctedSource.evidence.length,
           qualityStatus:composed?'review':'partial',
           articleChars:content.article.reduce(
             (n,item)=>n+item.text.length,0
           ),
           captionProofreadStatus:
-            fixed.accepted>0?'applied':'unchanged',
+            fixed.accepted+grammarAdjusted>0?'applied':'unchanged',
           captionProofreadAccepted:fixed.accepted,
           captionProofreadProposed:proposed,
-          captionLocalCorrections:localCorrections,
+          captionLocalCorrections:
+            localCorrections+grammarAdjusted,
           ...(composed?{}:{
             composeFailureCode:'INCOMPLETE_RESULT'
           })
@@ -826,7 +850,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
 
         result.analysisMeta.sourceMode='public-captions';
 
-        if(fixed.accepted+localCorrections>0)
+        if(fixed.accepted+grammarAdjusted+localCorrections>0)
           result.rawCaptionTranscript=originalCaptionLines;
 
         console.info(JSON.stringify({
@@ -838,6 +862,8 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
           accepted:fixed.accepted,
           rejected:fixed.rejected,
           localCorrections,
+          grammarAdjusted,
+          evidenceSynced:correctedSource!==source,
           timecodesPreserved,
           summary:content.summary.length,
           article:content.article.length,
