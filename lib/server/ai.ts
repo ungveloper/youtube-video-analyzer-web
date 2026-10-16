@@ -21,6 +21,7 @@ import {fetchYtDlpKoreanCaptions,preserveTimedCaptionTimeline,parseTimedCaptionS
 import {
   captionProofreadFormat,
   captionProofreadPrompt,
+  captionProofreadReviewPrompt,
   applyCaptionProofread,
   correctedLinesToSrt
 } from '@/lib/server/caption-proofread';
@@ -731,10 +732,104 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
             reviewed=await requestProofread(alternative);
           }
 
-          const fixed=applyCaptionProofread(
+          let fixed=applyCaptionProofread(
             baselineLines,
             reviewed.parsed
           );
+
+          let reviewProposed=0;
+          let reviewAccepted=0;
+          let reviewRejected=0;
+
+          // One optional additional text-only audit after a
+          // successful first pass. Never make a video request.
+          if(originalCaptionLines.length>=8 &&
+             originalCaptionLines.length<=90 &&
+             captions.srt.length<=24000){
+
+            onProgress({
+              type:'progress',
+              step:2,
+              label:'자막 전체 문맥 2차 검토',
+              detail:'앞뒤 문장이 이어지는 맥락을 다시 검토합니다.'
+            });
+
+            try{
+              proofreadCalls++;
+
+              const review=await interaction({
+                key,
+                model:captionModel,
+                requestId,
+                pass:'caption-proofread-review',
+                format:captionProofreadFormat,
+                input:[{
+                  type:'text',
+                  text:captionProofreadReviewPrompt(
+                    fixed.lines,video.title
+                  )
+                }],
+                signal,
+                timeoutMs:45000,
+                thinkingLevel:captionModel==='gemini-3.5-flash-lite'
+                  ?'low':'medium',
+                maxOutputTokens:Math.min(
+                  6500,
+                  Math.max(1800,originalCaptionLines.length*115)
+                )
+              });
+
+              const proposed=review.parsed &&
+                typeof review.parsed==='object'
+                ?(review.parsed as {corrections?:unknown}).corrections
+                :undefined;
+
+              reviewProposed=Array.isArray(proposed)
+                ?proposed.length:0;
+
+              const second=applyCaptionProofread(
+                fixed.lines,review.parsed
+              );
+
+              reviewAccepted=second.accepted;
+              reviewRejected=second.rejected;
+
+              fixed={
+                lines:second.lines,
+                accepted:fixed.accepted+second.accepted,
+                rejected:fixed.rejected+second.rejected
+              };
+
+              console.info(JSON.stringify({
+                event:'analysis.caption_proofread_review',
+                requestId,
+                model:captionModel,
+                proposed:reviewProposed,
+                accepted:reviewAccepted,
+                rejected:reviewRejected,
+                status:'completed'
+              }));
+
+            }catch(reviewError){
+              if(signal?.aborted)throw reviewError;
+
+              const code=reviewError instanceof ServiceError
+                ?reviewError.code:'INVALID_RESULT';
+
+              if(reviewError instanceof ServiceError &&
+                 reviewError.code==='FREE_LIMIT'){
+                proofreadingFailure=reviewError;
+              }
+
+              console.warn(JSON.stringify({
+                event:'analysis.caption_proofread_review_failed',
+                requestId,
+                model:captionModel,
+                code,
+                firstPassPreserved:true
+              }));
+            }
+          }
 
           const candidate=fixed.accepted>0
             ? correctedLinesToSrt(fixed.lines)
@@ -762,8 +857,8 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
               ?(reviewed.parsed as {corrections?:unknown}).corrections
               :undefined;
 
-          proofreadProposed=Array.isArray(rawCorrections)
-            ?rawCorrections.length:0;
+          proofreadProposed=(Array.isArray(rawCorrections)
+            ?rawCorrections.length:0)+reviewProposed;
           proofreadAccepted=timecodesPreserved?fixed.accepted:0;
           proofreadStatus=timecodesPreserved
             ?fixed.accepted>0?'applied':'unchanged'
@@ -780,6 +875,9 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
             accepted:timecodesPreserved?fixed.accepted:0,
             rejected:fixed.rejected,
             timecodesPreserved,
+            reviewAccepted,
+            reviewRejected,
+            proposedTotal:proofreadProposed,
             status:timecodesPreserved?'completed':'rejected'
           }));
 
