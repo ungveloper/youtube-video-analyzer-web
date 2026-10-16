@@ -15,6 +15,7 @@ import {assessTimelineTiming} from '@/lib/timeline-accuracy';
 import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS, remainingBasicAnalysisMs, hasBasic503RetryBudget } from '@/lib/provider-retry';
 import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
 import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
+import {fetchYtDlpKoreanCaptions,preserveTimedCaptionTimeline,parseTimedCaptionSrt} from '@/lib/server/ytdlp-captions';
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
@@ -579,12 +580,32 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
   const videoProcessing=resolveVideoProcessing(video.durationSeconds,model,processingPreference);
   if(!captionText?.trim()){
     onProgress({type:'progress',step:2,label:'공개 시간 지정 자막 확인',detail:'별도 Gemini 영상 호출 없이 공개 한국어 자막이 있는지 확인합니다. 사용 불가하면 기존 영상 분석을 사용합니다.'});
-    const captions=await fetchPublicKoreanCaptions(video.id,video.durationSeconds,signal);
+    const captions=await fetchPublicKoreanCaptions(video.id,video.durationSeconds,signal)
+      ?? await fetchYtDlpKoreanCaptions(video.id,video.durationSeconds,signal);
     console.info(JSON.stringify({event:'analysis.public_captions',requestId,available:!!captions,cueCount:captions?.count??0,endSeconds:captions?.end??null}));
     if(captions){
-      const result=await deepAnalysis(video,model,key,requestId,onProgress,signal,captions.srt,videoProcessing,retryOnBusy);
-      if(result.analysisMeta){result.analysisMeta.sourceMode='public-captions';result.analysisMeta.depth=depth;}
-      return result;
+      // Timed YouTube subtitles are the authoritative text/time source.
+      // Gemini may write an article but may NEVER rewrite caption timing.
+      const captionLines=parseTimedCaptionSrt(captions.srt,video.durationSeconds);
+      const captionEvidence=captionLines.map((l,i)=>({id:`timed-caption-e-${i}`,startSeconds:l.startSeconds,endSeconds:l.endSeconds,kind:'caption' as const,note:l.text}));
+      try{
+        const result=await deepAnalysis(video,model,key,requestId,onProgress,signal,captions.srt,videoProcessing,retryOnBusy);
+        const preserved=preserveTimedCaptionTimeline(result,captions.srt,video.durationSeconds);
+        console.info(JSON.stringify({event:'analysis.caption_first',requestId,cues:preserved,end:captions.end,source:'timed-youtube-caption'}));
+        if(result.analysisMeta){result.analysisMeta.sourceMode='public-captions';result.analysisMeta.depth=depth;}
+        return result;
+      }catch(error){
+        if(signal?.aborted)throw error;
+        const code=error instanceof ServiceError?error.code:'UNKNOWN';
+        if(!['FREE_LIMIT','PROVIDER_BUSY','TIMEOUT'].includes(code)||captionLines.length<3)throw error;
+        // Captions have already been read from YouTube. Even if Gemini's
+        // article call is throttled, keep a transparent caption-only result.
+        const content:AnalysisContent={summary:[],article:[],timeline:captionLines.map((l,i)=>({id:`timed-caption-t-${i}`,text:l.text,evidenceIds:[captionEvidence[i].id]})),transcript:captionLines,exclusions:[`Google AI 요약·아티클 요청 실패(${code}). YouTube에서 확보한 시간 지정 자막 ${captionLines.length}개만 표시합니다. 자막 시각은 YouTube 제공값이며 별도 음성 검증은 하지 않았습니다.`]};
+        const fallback=recordFromContent(video,model,captionEvidence,content);
+        fallback.analysisMeta={depth,videoProcessing:'captions',providerCalls:1,refinement:'kept-first',pipeline:'single-pass',sourceMode:'public-captions',qualityStatus:'partial'};
+        console.warn(JSON.stringify({event:'analysis.caption_first_fallback',requestId,code,captionLines:captionLines.length,articleGenerated:false}));
+        return fallback;
+      }
     }
   }
   if(depth==='deep' || captionText?.trim())return deepAnalysis(video,model,key,requestId,onProgress,signal,captionText,videoProcessing,retryOnBusy);
