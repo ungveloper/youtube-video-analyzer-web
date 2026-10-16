@@ -16,6 +16,12 @@ import { shouldRetryProviderBusy, waitBeforeProviderRetry, BUSY_RETRY_DELAY_MS, 
 import {speechReviewWindows, chooseSpeechRecoveryWindow, speechFirstTimeline, mergeSupplementalSpeech, dedupeInitialSpeech} from '@/lib/speech-timeline';
 import {fetchPublicKoreanCaptions} from '@/lib/server/public-captions';
 import {fetchYtDlpKoreanCaptions,preserveTimedCaptionTimeline,parseTimedCaptionSrt} from '@/lib/server/ytdlp-captions';
+import {
+  captionProofreadFormat,
+  captionProofreadPrompt,
+  applyCaptionProofread,
+  correctedLinesToSrt
+} from '@/lib/server/caption-proofread';
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
@@ -584,15 +590,118 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       ?? await fetchYtDlpKoreanCaptions(video.id,video.durationSeconds,signal);
     console.info(JSON.stringify({event:'analysis.public_captions',requestId,available:!!captions,cueCount:captions?.count??0,endSeconds:captions?.end??null}));
     if(captions){
+      const originalCaptionLines=parseTimedCaptionSrt(
+        captions.srt,video.durationSeconds
+      );
+
+      let proofreadCalls=0;
+      let appliedCorrections=0;
+      let proofreadingFailure:ServiceError|null=null;
+
+      if(originalCaptionLines.length>=3 &&
+         originalCaptionLines.length<=250 &&
+         captions.srt.length<=60000){
+
+        proofreadCalls=1;
+
+        onProgress({
+          type:'progress',
+          step:2,
+          label:'한국어 자동 자막 오타 교정',
+          detail:`${originalCaptionLines.length}개 자막의 문맥과 전문용어를 검토합니다. 영상은 다시 분석하지 않습니다.`
+        });
+
+        try{
+          const reviewed=await interaction({
+            key,model,requestId,
+            pass:'caption-proofread',
+            format:captionProofreadFormat,
+            input:[{
+              type:'text',
+              text:captionProofreadPrompt(
+                originalCaptionLines,
+                video.title
+              )
+            }],
+            signal,
+            timeoutMs:50000,
+            thinkingLevel:'medium',
+            maxOutputTokens:Math.min(
+              9000,
+              Math.max(2400,originalCaptionLines.length*140)
+            )
+          });
+
+          const fixed=applyCaptionProofread(
+            originalCaptionLines,
+            reviewed.parsed
+          );
+
+          const candidate=fixed.accepted>0
+            ? correctedLinesToSrt(fixed.lines)
+            : captions.srt;
+
+          const verified=parseTimedCaptionSrt(
+            candidate,video.durationSeconds
+          );
+
+          const timecodesPreserved=
+            verified.length===originalCaptionLines.length &&
+            verified.every((line,i)=>
+              line.startSeconds===originalCaptionLines[i].startSeconds &&
+              line.endSeconds===originalCaptionLines[i].endSeconds
+            );
+
+          if(timecodesPreserved){
+            captions.srt=candidate;
+            appliedCorrections=fixed.accepted;
+          }
+
+          console.info(JSON.stringify({
+            event:'analysis.caption_proofread',
+            requestId,model,
+            cues:originalCaptionLines.length,
+            accepted:timecodesPreserved?fixed.accepted:0,
+            rejected:fixed.rejected,
+            timecodesPreserved,
+            status:timecodesPreserved?'completed':'rejected'
+          }));
+
+        }catch(error){
+          if(signal?.aborted)throw error;
+
+          const code=error instanceof ServiceError
+            ?error.code:'INVALID_RESULT';
+
+          console.warn(JSON.stringify({
+            event:'analysis.caption_proofread_failed',
+            requestId,model,code
+          }));
+
+          if(error instanceof ServiceError &&
+             ['FREE_LIMIT','PROVIDER_BUSY','TIMEOUT']
+               .includes(error.code)){
+            proofreadingFailure=error;
+          }
+        }
+      }
+
       // Timed YouTube subtitles are the authoritative text/time source.
       // Gemini may write an article but may NEVER rewrite caption timing.
       const captionLines=parseTimedCaptionSrt(captions.srt,video.durationSeconds);
       const captionEvidence=captionLines.map((l,i)=>({id:`timed-caption-e-${i}`,startSeconds:l.startSeconds,endSeconds:l.endSeconds,kind:'caption' as const,note:l.text}));
       try{
+        if(proofreadingFailure)throw proofreadingFailure;
         const result=await deepAnalysis(video,model,key,requestId,onProgress,signal,captions.srt,videoProcessing,retryOnBusy);
         const preserved=preserveTimedCaptionTimeline(result,captions.srt,video.durationSeconds);
         console.info(JSON.stringify({event:'analysis.caption_first',requestId,cues:preserved,end:captions.end,source:'timed-youtube-caption'}));
-        if(result.analysisMeta){result.analysisMeta.sourceMode='public-captions';result.analysisMeta.depth=depth;}
+        if(result.analysisMeta){
+          result.analysisMeta.sourceMode='public-captions';
+          result.analysisMeta.depth=depth;
+          result.analysisMeta.providerCalls+=proofreadCalls;
+        }
+        if(appliedCorrections>0)
+          result.rawCaptionTranscript=originalCaptionLines;
         return result;
       }catch(error){
         if(signal?.aborted)throw error;
@@ -602,7 +711,9 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         // article call is throttled, keep a transparent caption-only result.
         const content:AnalysisContent={summary:[],article:[],timeline:captionLines.map((l,i)=>({id:`timed-caption-t-${i}`,text:l.text,evidenceIds:[captionEvidence[i].id]})),transcript:captionLines,exclusions:[`Google AI 요약·아티클 요청 실패(${code}). YouTube에서 확보한 시간 지정 자막 ${captionLines.length}개만 표시합니다. 자막 시각은 YouTube 제공값이며 별도 음성 검증은 하지 않았습니다.`]};
         const fallback=recordFromContent(video,model,captionEvidence,content);
-        fallback.analysisMeta={depth,videoProcessing:'captions',providerCalls:1,refinement:'kept-first',pipeline:'single-pass',sourceMode:'public-captions',qualityStatus:'partial'};
+        fallback.analysisMeta={depth,videoProcessing:'captions',providerCalls:proofreadCalls+(proofreadingFailure?0:1),refinement:'kept-first',pipeline:'single-pass',sourceMode:'public-captions',qualityStatus:'partial'};
+        if(appliedCorrections>0)
+          fallback.rawCaptionTranscript=originalCaptionLines;
         console.warn(JSON.stringify({event:'analysis.caption_first_fallback',requestId,code,captionLines:captionLines.length,articleGenerated:false}));
         return fallback;
       }

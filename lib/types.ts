@@ -4,6 +4,7 @@ export type TranscriptLine = { id: string; startSeconds: number; endSeconds: num
 export type AnalysisContent = { summary: GroundedItem[]; timeline: GroundedItem[]; article: GroundedItem[]; transcript: TranscriptLine[]; exclusions: string[] };
 export type VideoInfo = { id: string; title: string; channel: string; thumbnail: string; durationSeconds: number; url: string };
 export type AnalysisRecord = {
+  rawCaptionTranscript?: TranscriptLine[];
   id: string; video: VideoInfo; createdAt: string; updatedAt: string; model: string;
   evidence: Evidence[]; original: AnalysisContent; edited: AnalysisContent;
   analysisMeta?: { videoProcessing?: 'static' | 'agentic' | 'captions'; elapsedMs?: number; inputTokens?: number; outputTokens?: number; depth: 'standard' | 'deep'; providerCalls: number; refinement: 'improved' | 'kept-first' | 'not-needed'; pipeline?: 'single-pass' | 'evidence-compose'; sourceClaims?: number; sourceEvidence?: number; sourceMode?: 'user-captions' | 'public-captions' | 'video-url'; qualityStatus?: 'review' | 'partial'; coveragePercent?: number; sourceEndPercent?: number; articleChars?: number; composeFailureCode?: string; composeRecovery?: 'article-only' };
