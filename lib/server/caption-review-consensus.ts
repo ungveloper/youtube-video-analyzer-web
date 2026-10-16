@@ -1,5 +1,3 @@
-import type {TranscriptLine} from '@/lib/types';
-
 type Correction={
   index:number;
   before:string;
