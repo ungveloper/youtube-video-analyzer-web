@@ -3,89 +3,126 @@ import fs from 'node:fs';
 import ts from 'typescript';
 import {createRequire} from 'node:module';
 
-const source=fs.readFileSync(
-  'lib/server/caption-cleanup.ts','utf8'
-);
-const js=ts.transpileModule(source,{
-  compilerOptions:{
-    target:ts.ScriptTarget.ES2022,
-    module:ts.ModuleKind.CommonJS
-  },
-  reportDiagnostics:true
-});
-assert.equal(js.diagnostics?.length??0,0);
+function load(path){
+  const source=fs.readFileSync(path,'utf8');
+  const compiled=ts.transpileModule(source,{
+    fileName:path,
+    compilerOptions:{
+      target:ts.ScriptTarget.ES2022,
+      module:ts.ModuleKind.CommonJS
+    },
+    reportDiagnostics:true
+  });
+  assert.equal(compiled.diagnostics?.length??0,0);
+  const exports={};
+  Function('require','exports',compiled.outputText)(
+    createRequire(import.meta.url),exports
+  );
+  return exports;
+}
 
-const lib={};
-Function('require','exports',js.outputText)(
-  createRequire(import.meta.url),lib
-);
+const local=load('lib/server/caption-cleanup.ts');
+const proof=load('lib/server/caption-proofread.ts');
 
-const words=[
- '그게 바로 가지 동맹입니다.',
- '말초 동매 즉 다리부터 폐색이 발생합니다.',
- '담배로 생기는 혈관념이 있습니다.',
- '근육에 눌려서 포핵 중후가 발생합니다.',
- '무릎 뒤에 있는 스화 동맥을 눌렀습니다.',
- '동맥의 회색에 의해서 통증이 생깁니다.',
- '척추한 협착증 같은 허리 질환입니다.',
- '통증 신호를 보내면서 보내면서 보내면서 많이 걸 수가 없습니다.',
- '이건 단순한 필요에 의한 것이 아닙니다.',
- '한번 점검해 보시길 바랍니다.',
- '바랍니다. 바랍니다. 정맥병원 변승제 원장입니다.',
- '환자의 나이는 20대이며 발생률은 80%입니다.'
+const samples=[
+  '설명을 하면서 하면서 하면서 마무리합니다.',
+  '마지막으로 감사합니다. 감사합니다. 감사합니다.',
+  '정말 정말 중요한 이야기입니다.',
+  '이번 분기 영업이익은 17%입니다.',
+  '다음 시간에 다시 뵙겠습니다.',
+  '뵙겠습니다. 오늘은 마무리하겠습니다.',
+  '그게 바로 가지 동맹입니다.'
 ];
 
-const lines=words.map((text,i)=>({
-  id:'line-'+i,
+const lines=samples.map((text,i)=>({
+  id:String(i),
   startSeconds:i*5,
   endSeconds:i*5+4.9,
   text,
   translated:false
 }));
 
-const result=lib.normalizeCaptionErrors(lines);
+const result=local.normalizeCaptionErrors(lines);
 
 assert.equal(result.lines.length,lines.length);
-assert.equal(result.lines[0].text,'그게 바로 하지 동맥입니다.');
-assert.match(result.lines[1].text,/말초 동맥/);
-assert.match(result.lines[2].text,/혈관염/);
-assert.match(result.lines[3].text,/포획 증후군/);
-assert.match(result.lines[4].text,/슬와 동맥/);
-assert.match(result.lines[5].text,/동맥의 폐색/);
-assert.match(result.lines[6].text,/척추관 협착증/);
 assert.equal(
-  result.lines[7].text,
-  '통증 신호를 보내면서 많이 걸을 수가 없습니다.'
+  result.lines[0].text,
+  '설명을 하면서 마무리합니다.'
 );
-assert.match(result.lines[8].text,/단순한 피로/);
 assert.equal(
-  result.lines[10].text,
-  '정맥병원 변승제 원장입니다.'
+  result.lines[1].text,
+  '마지막으로 감사합니다.'
 );
-assert.equal(result.lines[11].text,words[11]);
+assert.equal(
+  result.lines[2].text,
+  '정말 정말 중요한 이야기입니다.'
+);
+assert.equal(result.lines[3].text,samples[3]);
+assert.equal(
+  result.lines[5].text,
+  '오늘은 마무리하겠습니다.'
+);
+
+// Local rules may not guess a topic-specific correction.
+assert.equal(result.lines[6].text,samples[6]);
 
 for(let i=0;i<lines.length;i++){
-  assert.equal(result.lines[i].startSeconds,lines[i].startSeconds);
-  assert.equal(result.lines[i].endSeconds,lines[i].endSeconds);
-  assert.equal(lines[i].text,words[i],'Input must stay immutable');
+  assert.equal(
+    result.lines[i].startSeconds,
+    lines[i].startSeconds
+  );
+  assert.equal(
+    result.lines[i].endSeconds,
+    lines[i].endSeconds
+  );
+  assert.equal(lines[i].text,samples[i]);
 }
 
-const ordinary=lib.normalizeCaptionErrors([{
-  id:'ordinary',
-  startSeconds:0,
-  endSeconds:3,
-  text:'오늘은 책을 읽고 산책을 했습니다.',
+const finance=[
+  '삼상전자 주가가 상승했습니다.',
+  '에어프라어로 감자를 조리합니다.',
+  '새 버전은 80% 빨라졌습니다.'
+].map((text,i)=>({
+  id:String(i),
+  startSeconds:i*5,
+  endSeconds:i*5+4.9,
+  text,
   translated:false
-}]);
-assert.equal(ordinary.changed,0);
+}));
+
+const corrected=proof.applyCaptionProofread(finance,{
+  corrections:[
+    {index:0,text:'삼성전자 주가가 상승했습니다.'},
+    {index:1,text:'에어프라이어로 감자를 조리합니다.'},
+    {index:2,text:'새 버전은 90% 빨라졌습니다.'}
+  ]
+});
+
+assert.equal(corrected.accepted,2);
+assert.equal(corrected.rejected,1);
+assert.match(corrected.lines[0].text,/삼성전자/);
+assert.match(corrected.lines[1].text,/에어프라이어/);
+assert.equal(corrected.lines[2].text,finance[2].text);
+
+const prompt=proof.captionProofreadPrompt(
+  finance,'금융과 생활용품 리뷰'
+);
+assert.match(prompt,/모든 분야/);
+assert.match(prompt,/전체 자막/);
+assert.match(prompt,/금융과 생활용품 리뷰/);
+
+const cleanupSource=fs.readFileSync(
+  'lib/server/caption-cleanup.ts','utf8'
+);
+assert.doesNotMatch(cleanupSource,/medicalRules/);
+assert.doesNotMatch(cleanupSource,/가지\\s\*동맹/);
 
 const ai=fs.readFileSync('lib/server/ai.ts','utf8');
 assert.match(ai,/normalizeCaptionErrors\(originalCaptionLines\)/);
-assert.match(ai,/text:captionProofreadPrompt\(\s*baselineLines/);
+assert.match(ai,/captionProofreadPrompt\(\s*baselineLines/);
 assert.match(ai,/applyCaptionProofread\(\s*baselineLines/);
-assert.match(ai,/appliedCorrections\+=fixed.accepted/);
-assert.match(ai,/event:'analysis.caption_local_cleanup'/);
+assert.match(ai,/strategy:'domain-neutral'/);
 
 console.log(
-  'PASS: local terminology, duplicate removal, names/numbers unchanged, timestamps preserved, AI pipeline wired'
+ 'PASS: topic-neutral deduplication, multi-domain contextual proofreading, protected numbers, immutable timestamps'
 );

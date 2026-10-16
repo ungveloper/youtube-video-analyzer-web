@@ -624,7 +624,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         cues:originalCaptionLines.length,
         changed:localCorrections,
         repeated:localCorrections?localCleanup.repeated:0,
-        terminology:localCorrections?localCleanup.terminology:0
+        strategy:'domain-neutral'
       }));
 
       let proofreadCalls=0;
