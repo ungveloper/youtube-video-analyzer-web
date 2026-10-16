@@ -8,6 +8,7 @@ import { assessDetail, detailTargets } from '@/lib/analysis-detail';
 import { parseSourceMap, extractComposedContent, fallbackFromSource, sourceMapPrompt, composePrompt, sourceResponseFormat, composedResponseFormat, articleOnlyRecoveryPrompt, articleOnlyResponseFormat, recoverArticleFromSource, focusedTailPrompt, mergeFocusedTail } from '@/lib/server/evidence-pipeline';
 import { sourceFromUserCaptions, timelineFromProvidedCaptions } from '@/lib/server/caption-source';
 import {captionArticleFromEvidence} from '@/lib/server/caption-article-fallback';
+import {freeTextFallbackModel} from '@/lib/server/free-text-fallback';
 import { assessSourceCoverage, assessSinglePassCoverage } from '@/lib/quality-audit';
 import { timelineFromSourceClaims, timelineFromEvidenceNotes, appendUnreferencedEvidenceNotes } from '@/lib/timeline-granularity';
 import {coverageWindows,hasLateAnchors,missingEvidenceWindows} from '@/lib/temporal-coverage';
@@ -243,9 +244,10 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   let composeFailureCode: string | undefined;
   let stage2tokens:null|{input:number|null;output:number|null}=null;
   let compositionCalls=0;
+  let finalModel:FreeModelId=model;
   try {
     compositionCalls++;
-    const stage2=await interaction({key,model,requestId,pass:'compose',format:composedResponseFormat,input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],signal,timeoutMs:125000});
+    const stage2=await interaction({key,model,requestId,pass:'compose',format:composedResponseFormat,input:[{type:'text',text:composePrompt(source,video.durationSeconds)}],signal,timeoutMs:provided?70000:125000});
     content=extractComposedContent(stage2.parsed,source);
     composed=true;
     stage2tokens=stage2.tokens;
@@ -258,16 +260,30 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
     // A narrow article-only retry is easier for a provider to satisfy than a
     // three-document structured response. It uses text evidence, never a new video call.
     // Do not retry a quota, permissions, or cancellation error.
-    const retryable=['TEMPORARY_HTTP','TIMEOUT','INVALID_RESULT','PROVIDER_BUSY'].includes(composeFailureCode);
+    const retryable=['TEMPORARY_HTTP','TIMEOUT','INVALID_RESULT','PROVIDER_BUSY'].includes(composeFailureCode)
+      && (!provided ||
+        !!freeTextFallbackModel(model,composeFailureCode??''));
     if(retryable){
       onProgress({type:'progress',step:3,attempt:sourceCalls+2,label:'아티클 전용 복구 시도',detail:'전체 문서 요청이 실패해 더 작은 아티클 전용 요청을 한 번만 시도합니다. 무료 요청을 추가 사용합니다.'});
       try {
         compositionCalls++;
         await new Promise<void>((resolve,reject)=>{const timer=setTimeout(resolve,1000);signal?.addEventListener('abort',()=>{clearTimeout(timer);reject(new ServiceError('CANCELLED','중단됨',499));},{once:true});});
-        const recovery=await interaction({key,model,requestId,pass:'article-recovery',format:articleOnlyResponseFormat,
-          input:[{type:'text',text:articleOnlyRecoveryPrompt(source,video.durationSeconds)}],signal,timeoutMs:90000,thinkingLevel:'low',maxOutputTokens:9000});
+        const articleModel=provided
+          ?(freeTextFallbackModel(model,composeFailureCode??'')??model)
+          :model;
+
+        if(articleModel!==model)
+          console.warn(JSON.stringify({
+            event:'analysis.article_free_model_fallback',
+            requestId,from:model,to:articleModel,
+            reason:composeFailureCode
+          }));
+
+        const recovery=await interaction({key,model:articleModel,requestId,pass:'article-recovery',format:articleOnlyResponseFormat,
+          input:[{type:'text',text:articleOnlyRecoveryPrompt(source,video.durationSeconds)}],signal,timeoutMs:provided?65000:90000,thinkingLevel:'low',maxOutputTokens:9000});
         content=recoverArticleFromSource(recovery.parsed,source);
         composed=true;
+        finalModel=articleModel;
         composeRecovery='article-only';
         stage2tokens=recovery.tokens;
         console.info(JSON.stringify({event:'analysis.article_recovered',requestId,model,articleSections:content.article.length}));
@@ -336,7 +352,7 @@ async function deepAnalysis(video:VideoInfo,model:FreeModelId,key:string,request
   if(composeRecovery)content.exclusions.push('복구된 아티클은 원본 근거를 사용했으나 요약·타임라인은 1차 근거 메모입니다. 전체 상세 분석으로 확정하지 않았습니다.');
   if(audit.articleIncomplete) content.exclusions.push(composed?'아티클이 상세도 기준에 미치지 못합니다. 근거만으로 충분한 설명을 생성하지 못했습니다.':provided?'AI 아티클 작성에 실패해 시간 지정 원문을 문단으로 복구했습니다. 자동 작성된 해설문이 아닙니다.':'2차 아티클 생성 실패: 아티클은 제공하지 않고 1차 근거 메모만 보여줍니다.');
   if(audit.qualityStatus==='partial') content.exclusions.push('부분 분석으로 분류했습니다. 실제 영상과 대조하여 누락된 내용을 확인하세요.');
-  const result=recordFromContent(video,model,source.evidence,content);
+  const result=recordFromContent(video,finalModel,source.evidence,content);
   result.analysisMeta={depth:'deep',videoProcessing:provided?'captions':videoProcessing,elapsedMs:Date.now()-analysisStarted,providerCalls:sourceCalls+compositionCalls,refinement:composed?'improved':'kept-first',pipeline:'evidence-compose',sourceClaims:source.claims.length,sourceEvidence:source.evidence.length, sourceMode:provided?'user-captions':'video-url', qualityStatus:audit.qualityStatus,coveragePercent:audit.coveragePercent,sourceEndPercent:audit.sourceEndPercent,articleChars:audit.articleChars,composeFailureCode,composeRecovery};
   onProgress({type:'progress',step:4,label:'근거 연결 검사 완료',detail:'존재하는 근거 ID·시간 범위를 확인했습니다. 사실 일치는 원본 대조가 필요합니다.'});
   const quality=assessDetail(content,video.durationSeconds);
@@ -649,6 +665,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       }));
 
       let proofreadCalls=0;
+      let captionModel:FreeModelId=model;
       let appliedCorrections=localCorrections;
       let proofreadingFailure:ServiceError|null=null;
       let proofreadStatus:'skipped'|'applied'|'unchanged'|'failed'='skipped';
@@ -660,8 +677,6 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
          originalCaptionLines.length<=250 &&
          captions.srt.length<=60000){
 
-        proofreadCalls=1;
-
         onProgress({
           type:'progress',
           step:2,
@@ -670,25 +685,51 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         });
 
         try{
-          const reviewed=await interaction({
-            key,model,requestId,
-            pass:'caption-proofread',
-            format:captionProofreadFormat,
-            input:[{
-              type:'text',
-              text:captionProofreadPrompt(
-                baselineLines,
-                video.title
+          const requestProofread=async(candidate:FreeModelId)=>{
+            proofreadCalls++;
+            return interaction({
+              key,model:candidate,requestId,
+              pass:'caption-proofread',
+              format:captionProofreadFormat,
+              input:[{
+                type:'text',
+                text:captionProofreadPrompt(
+                  baselineLines,video.title
+                )
+              }],
+              signal,
+              timeoutMs:65000,
+              thinkingLevel:candidate==='gemini-3.5-flash-lite'
+                ?'low':'medium',
+              maxOutputTokens:Math.min(
+                9000,
+                Math.max(2400,originalCaptionLines.length*140)
               )
-            }],
-            signal,
-            timeoutMs:75000,
-            thinkingLevel:'medium',
-            maxOutputTokens:Math.min(
-              9000,
-              Math.max(2400,originalCaptionLines.length*140)
-            )
-          });
+            });
+          };
+
+          let reviewed:Awaited<ReturnType<typeof interaction>>;
+
+          try{
+            reviewed=await requestProofread(model);
+          }catch(primaryError){
+            if(signal?.aborted)throw primaryError;
+
+            const code=primaryError instanceof ServiceError
+              ?primaryError.code:'UNKNOWN';
+
+            const alternative=freeTextFallbackModel(model,code);
+            if(!alternative)throw primaryError;
+
+            captionModel=alternative;
+
+            console.warn(JSON.stringify({
+              event:'analysis.caption_proofread_free_fallback',
+              requestId,from:model,to:alternative,code
+            }));
+
+            reviewed=await requestProofread(alternative);
+          }
 
           const fixed=applyCaptionProofread(
             baselineLines,
@@ -732,7 +773,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
 
           console.info(JSON.stringify({
             event:'analysis.caption_proofread',
-            requestId,model,
+            requestId,model:captionModel,
             proposed:Array.isArray(rawCorrections)
               ?rawCorrections.length:null,
             cues:originalCaptionLines.length,
@@ -753,7 +794,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
 
           console.warn(JSON.stringify({
             event:'analysis.caption_proofread_failed',
-            requestId,model,code
+            requestId,model:captionModel,code
           }));
 
           if(error instanceof ServiceError &&
@@ -770,7 +811,9 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
       const captionEvidence=captionLines.map((l,i)=>({id:`timed-caption-e-${i}`,startSeconds:l.startSeconds,endSeconds:l.endSeconds,kind:'caption' as const,note:l.text}));
       try{
         if(proofreadingFailure?.code==='FREE_LIMIT')throw proofreadingFailure;
-        const result=await deepAnalysis(video,model,key,requestId,onProgress,signal,captions.srt,videoProcessing,retryOnBusy);
+        if(proofreadingFailure?.code==='PROVIDER_BUSY' ||
+           proofreadingFailure?.code==='TIMEOUT')throw proofreadingFailure;
+        const result=await deepAnalysis(video,captionModel,key,requestId,onProgress,signal,captions.srt,videoProcessing,retryOnBusy);
         const preserved=preserveTimedCaptionTimeline(result,captions.srt,video.durationSeconds);
         console.info(JSON.stringify({event:'analysis.caption_first',requestId,cues:preserved,end:captions.end,source:'timed-youtube-caption'}));
         if(result.analysisMeta){
@@ -793,7 +836,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         // Captions have already been read from YouTube. Even if Gemini's
         // article call is throttled, keep a transparent caption-only result.
         const content:AnalysisContent={summary:[],article:captionArticleFromEvidence(captionEvidence),timeline:captionLines.map((l,i)=>({id:`timed-caption-t-${i}`,text:l.text,evidenceIds:[captionEvidence[i].id]})),transcript:captionLines,exclusions:[`Google AI 교정 또는 작성 요청 실패(${code}). 확보된 시간 지정 자막 ${captionLines.length}개로 원문 문단을 구성했습니다. AI가 작성한 완성 아티클은 아니며 실제 음성 검증은 하지 않았습니다.`]};
-        const fallback=recordFromContent(video,model,captionEvidence,content);
+        const fallback=recordFromContent(video,captionModel,captionEvidence,content);
         fallback.analysisMeta={depth,videoProcessing:'captions',providerCalls:proofreadCalls+(proofreadingFailure?0:1),refinement:'kept-first',pipeline:'single-pass',sourceMode:'public-captions',qualityStatus:'partial',captionProofreadStatus:proofreadStatus,captionProofreadAccepted:proofreadAccepted,captionProofreadProposed:proofreadProposed,captionProofreadCode:proofreadCode,captionLocalCorrections:localCorrections,composeFailureCode:code};
         if(appliedCorrections>0)
           fallback.rawCaptionTranscript=originalCaptionLines;
