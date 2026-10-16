@@ -22,6 +22,7 @@ import {
   applyCaptionProofread,
   correctedLinesToSrt
 } from '@/lib/server/caption-proofread';
+import {normalizeCaptionErrors} from '@/lib/server/caption-cleanup';
 import {shortSpeechSegments,precisionSpeechSegments,clipVideoInputs,parseSegmentedSpeech} from '@/lib/segmented-speech';
 import { readInteractionSse } from '@/lib/server/interaction-sse';
 import {makeSpeechClipRequest,collectSpeechClipResults,speechSource,formatMissingWindows} from '@/lib/speech-clip-pipeline';
@@ -594,8 +595,40 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
         captions.srt,video.durationSeconds
       );
 
+      // Preserve the unmodified YouTube cues for comparison.
+      // This local pass works even when Gemini is unavailable.
+      const localCleanup=normalizeCaptionErrors(originalCaptionLines);
+      let baselineLines=originalCaptionLines;
+      let localCorrections=0;
+
+      if(localCleanup.changed>0){
+        const localSrt=correctedLinesToSrt(localCleanup.lines);
+        const checked=parseTimedCaptionSrt(localSrt,video.durationSeconds);
+
+        const valid=checked.length===originalCaptionLines.length &&
+          checked.every((line,i)=>
+            line.startSeconds===originalCaptionLines[i].startSeconds &&
+            line.endSeconds===originalCaptionLines[i].endSeconds
+          );
+
+        if(valid){
+          captions.srt=localSrt;
+          baselineLines=localCleanup.lines;
+          localCorrections=localCleanup.changed;
+        }
+      }
+
+      console.info(JSON.stringify({
+        event:'analysis.caption_local_cleanup',
+        requestId,
+        cues:originalCaptionLines.length,
+        changed:localCorrections,
+        repeated:localCorrections?localCleanup.repeated:0,
+        terminology:localCorrections?localCleanup.terminology:0
+      }));
+
       let proofreadCalls=0;
-      let appliedCorrections=0;
+      let appliedCorrections=localCorrections;
       let proofreadingFailure:ServiceError|null=null;
 
       if(originalCaptionLines.length>=3 &&
@@ -619,7 +652,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
             input:[{
               type:'text',
               text:captionProofreadPrompt(
-                originalCaptionLines,
+                baselineLines,
                 video.title
               )
             }],
@@ -633,7 +666,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
           });
 
           const fixed=applyCaptionProofread(
-            originalCaptionLines,
+            baselineLines,
             reviewed.parsed
           );
 
@@ -654,7 +687,7 @@ export async function analyzeVideo(video:VideoInfo,requestId:string,onProgress:(
 
           if(timecodesPreserved){
             captions.srt=candidate;
-            appliedCorrections=fixed.accepted;
+            appliedCorrections+=fixed.accepted;
           }
 
           console.info(JSON.stringify({
