@@ -3,6 +3,7 @@ import type { AnalysisRecord, AnalysisContent,GroundedItem,TranscriptLine } from
 import { timestamp } from '@/lib/youtube';
 import { timelineTime } from '@/lib/timeline-granularity';
 import {timelineStartSeconds} from '@/lib/timeline-accuracy';
+import {readableCaptionTimeline} from '@/lib/caption-reading-flow';
 function section(name:string, items:GroundedItem[], evidence:AnalysisRecord['evidence']){
   return `## ${name}\n\n`+items.map(i=>{
     const sources=i.evidenceIds.map(id=>evidence.find(e=>e.id===id)).filter((e):e is NonNullable<typeof e>=>Boolean(e));
@@ -11,7 +12,11 @@ function section(name:string, items:GroundedItem[], evidence:AnalysisRecord['evi
 }
 function timelineSection(items:GroundedItem[], evidence:AnalysisRecord['evidence'], captionSource:boolean) {
   const lookup = new Map(evidence.map(item=>[item.id,item]));
-  const entries = items.map(item=>{
+  const readingItems=captionSource
+    ? readableCaptionTimeline(items,evidence)
+    : items;
+
+  const entries = readingItems.map(item=>{
     const refs=item.evidenceIds.map(id=>lookup.get(id)).filter((e):e is NonNullable<typeof e>=>Boolean(e));
     const start=timelineStartSeconds(item,evidence);
     return {item,refs,start};

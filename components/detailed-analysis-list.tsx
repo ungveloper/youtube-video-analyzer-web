@@ -3,6 +3,7 @@ import type { Evidence, GroundedItem, TranscriptLine } from '@/lib/types';
 import { timestamp } from '@/lib/youtube';
 import { timelineTime } from '@/lib/timeline-granularity';
 import { timelineStartSeconds } from '@/lib/timeline-accuracy';
+import {readableCaptionTimeline} from '@/lib/caption-reading-flow';
 
 type Tab = 'summary' | 'timeline' | 'article' | 'transcript';
 export function DetailedAnalysisList({
@@ -19,8 +20,17 @@ export function DetailedAnalysisList({
   timeSource: 'captions' | 'ai';
 }) {
   const evidenceMap = new Map(evidence.map(item => [item.id, item]));
+  const readableItems =
+    tab === 'timeline' &&
+    timeSource === 'captions' &&
+    !editing
+      ? readableCaptionTimeline(
+          items as GroundedItem[],evidence
+        )
+      : items;
+
   const ordered = tab === 'timeline'
-    ? [...items].sort((left, right) => {
+    ? [...readableItems].sort((left, right) => {
         const getStart = (item: GroundedItem | TranscriptLine) => {
           if ('startSeconds' in item) return item.startSeconds;
           return timelineStartSeconds(item, evidence) ?? Number.POSITIVE_INFINITY;
